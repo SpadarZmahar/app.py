@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.vscode/
+.DS_Store
+vfs_state.json
+sentry-secrets.ini

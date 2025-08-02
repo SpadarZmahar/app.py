@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VFS Global Slot Monitor</title>
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; margin: 20px; }
+        pre { background-color: #f4f4f4; padding: 10px; border-radius: 5px; }
+        .time { font-size: 0.9em; color: #666; }
+    </style>
+</head>
+<body>
+    <h1>Статус слотов VFS Global</h1>
+    <p class="time">Последнее обновление: {{ time }}</p>
+    <pre>{{ status_report }}</pre>
+    <p><a href="/check">Запустить проверку вручную</a></p>
+    <p><a href="/test">Отправить тестовое сообщение в Telegram</a></p>
+</body>
+</html>
