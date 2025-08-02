@@ -26,9 +26,9 @@ if os.getenv('SENTRY_DSN'):
         traces_sample_rate=1.0
     )
 
-# Настройка логов
+# Настройка логов - ВКЛЮЧЕН DEBUG РЕЖИМ!
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # DEBUG для диагностики
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
@@ -205,11 +205,12 @@ def parse_lock_time(error_text: str) -> int:
 def login_session():
     """Выполняет вход в систему с обработкой капчи и повторными попытками"""
     global account_locked_until
-    logger.info("🔑 Начинаю вход в систему...")
+    logger.debug("🔑 Начинаю вход в систему...")
     for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
         try:
-            logger.info(f"🔑 Попытка входа #{attempt}/{MAX_LOGIN_ATTEMPTS}")
+            logger.debug(f"🔑 Попытка входа #{attempt}/{MAX_LOGIN_ATTEMPTS}")
             
+            logger.debug("🛠️ Создаю cloudscraper сессию")
             scraper = cloudscraper.create_scraper(
                 browser={
                     'browser': 'chrome',
@@ -222,11 +223,15 @@ def login_session():
             )
             
             login_url = f"{BASE_URL}/account/login"
+            logger.debug(f"🌐 Загружаю страницу входа: {login_url}")
             resp = scraper.get(login_url, timeout=REQUEST_TIMEOUT)
+            logger.debug(f"🚩 Статус ответа: {resp.status_code}")
             resp.raise_for_status()
             
+            logger.debug("🔍 Ищу CSRF-токен на странице")
             soup = BeautifulSoup(resp.text, 'html.parser')
             csrf_token = soup.find('input', {'name': '_csrf'})['value'] if soup.find('input', {'name': '_csrf'}) else None
+            logger.debug(f"🔑 CSRF-токен: {csrf_token[:10]}...")
             
             # Проверяем наличие капчи
             captcha_img = soup.select_one('img.captcha-img')
@@ -238,7 +243,15 @@ def login_session():
                     # Извлекаем base64 изображение
                     base64_data = captcha_url.split(',', 1)[1]
                     logger.warning("⚠️ Обнаружена капча, пытаюсь решить...")
-                    captcha_solution = solve_captcha(base64_data)
+                    if ANTI_CAPTCHA_KEY:
+                        logger.debug("🔄 Пытаюсь решить капчу")
+                        captcha_solution = solve_captcha(base64_data)
+                        if captcha_solution:
+                            logger.debug(f"🔢 Решение капчи: {captcha_solution}")
+                        else:
+                            logger.error("❌ Не удалось решить капчу")
+                    else:
+                        logger.error("❌ Ключ anti-captcha отсутствует!")
             
             login_data = {
                 "email": EMAIL,
@@ -249,20 +262,22 @@ def login_session():
             if captcha_solution:
                 login_data["captcha"] = captcha_solution
             
-            time.sleep(random.uniform(3, 7))  # Увеличенная задержка
+            logger.debug(f"📤 Отправляю данные входа (email: {EMAIL})")
+            time.sleep(random.uniform(3, 7))
             response = scraper.post(login_url, data=login_data, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
+            logger.debug(f"🚩 Статус входа: {response.status_code}")
             
             if "account/dashboard" in response.url:
                 logger.info("✅ Успешный вход")
                 return scraper
                 
             # Проверяем ошибки
+            logger.warning("⚠️ Не удалось войти, анализирую ошибку...")
             error_soup = BeautifulSoup(response.text, 'html.parser')
             error_div = error_soup.select_one('div.alert-danger')
             if error_div:
                 error_text = error_div.get_text(strip=True)
-                logger.warning(f"⚠️ Ошибка входа: {error_text}")
+                logger.error(f"❌ Ошибка входа: {error_text}")
                 
                 # Если это капча, пробуем еще раз
                 if "captcha" in error_text.lower() and attempt < MAX_LOGIN_ATTEMPTS:
@@ -277,10 +292,18 @@ def login_session():
                         account_locked_until = datetime.utcnow() + timedelta(seconds=lock_time)
                     return None
                     
+            # Сохраняем HTML для диагностики
+            try:
+                with open("login_error.html", "w", encoding="utf-8") as f:
+                    f.write(response.text)
+                logger.info("💾 Сохранен HTML страницы с ошибкой: login_error.html")
+            except Exception as e:
+                logger.error(f"❌ Ошибка сохранения HTML: {str(e)}")
+                
             logger.error("❌ Не удалось войти в аккаунт")
             
         except Exception as e:
-            logger.error(f"❌ Ошибка входа: {str(e)}")
+            logger.exception(f"🔥 Критическая ошибка при входе: {str(e)}")
         
         # Задержка перед следующей попыткой
         if attempt < MAX_LOGIN_ATTEMPTS:
@@ -302,7 +325,7 @@ def get_center_page(city: str, subcategory: str = ""):
             time.sleep(wait_sec + 5)  # Ждем блокировку + 5 секунд
             account_locked_until = None  # Сбрасываем блокировку
 
-    logger.info(f"🌐 Загружаю страницу для {city} ({subcategory})...")
+    logger.debug(f"🌐 Загружаю страницу для {city} ({subcategory})...")
     config = VISA_CENTERS[city]
     scraper = get_session()
     if not scraper:
@@ -363,7 +386,7 @@ def get_center_page(city: str, subcategory: str = ""):
                         account_locked_until = datetime.utcnow() + timedelta(seconds=lock_time)
                     return "account_locked"
             
-            logger.info(f"✅ Страница для {city} ({subcategory}) загружена")
+            logger.debug(f"✅ Страница для {city} ({subcategory}) загружена")
             return resp.text
             
         except Timeout:
@@ -382,7 +405,7 @@ def get_center_page(city: str, subcategory: str = ""):
 
 def get_page_status(city: str, subcategory: str = "") -> str:
     try:
-        logger.info(f"🔎 Проверка {city} ({subcategory})...")
+        logger.debug(f"🔎 Проверка {city} ({subcategory})...")
         page_content = get_center_page(city, subcategory)
         if page_content is None:
             return "error"
@@ -470,7 +493,7 @@ def save_state(state: dict):
 
 def check_slots(chat_id: str = None) -> bool:
     start_time = time.time()
-    logger.info("🔍 Начинаю проверку слотов...")
+    logger.debug("🔍 Начинаю проверку слотов...")
     
     # Для ручных проверок отправляем уведомление о начале
     if chat_id:
@@ -486,7 +509,7 @@ def check_slots(chat_id: str = None) -> bool:
 
     # Проверяем вход в систему
     login_start = time.time()
-    logger.info("🔐 Проверяем сессию...")
+    logger.debug("🔐 Проверяем сессию...")
     session = get_session()
     login_time = time.time() - login_start
     
@@ -539,7 +562,7 @@ def check_slots(chat_id: str = None) -> bool:
             
             # Задержка между проверками
             delay = random.uniform(2.0, 4.0)
-            logger.info(f"⏱️ Задержка {delay:.2f} сек перед {city} ({subcat})")
+            logger.debug(f"⏱️ Задержка {delay:.2f} сек перед {city} ({subcat})")
             time.sleep(delay)
             
             previous_status = current_state.get(key, "")
@@ -624,6 +647,9 @@ def set_webhook():
     if not hostname:
         return Response("❌ EXTERNAL_HOSTNAME не установлен", status=500)
         
+    # Удаляем протокол, если есть
+    hostname = hostname.replace("https://", "").replace("http://", "")
+    
     webhook_url = f"https://{hostname}{WEBHOOK_SECRET_PATH}"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
     
