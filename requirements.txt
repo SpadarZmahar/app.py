@@ -5,3 +5,4 @@ cloudscraper==1.2.71
 pytz==2023.3
 sentry-sdk[flask]==1.34.0
 urllib3==1.26.18
+lxml==5.2.1
