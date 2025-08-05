@@ -1,115 +1,94 @@
 import os
-import time
 import logging
-import threading
+import json
 import cloudscraper
 from flask import Flask, request
-import telegram
-import html
-import re
+from telegram import Bot, Update
+from telegram.ext import Dispatcher, CommandHandler
+from threading import Thread
+from bs4 import BeautifulSoup
 
-# --- Конфигурация ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))  # в минутах
+# Настройки логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# Переменные окружения
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
 app = Flask(__name__)
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
-scraper = cloudscraper.create_scraper()
+bot = Bot(token=TELEGRAM_TOKEN)
+dispatcher = Dispatcher(bot, None, workers=0)
 
-last_news_text = None
+last_news_hash = None
 
-def send_telegram(message):
+def fetch_news():
     try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)  # без parse_mode
-        logger.info("Отправлено сообщение в Telegram")
+        scraper = cloudscraper.create_scraper()
+        response = scraper.get(NEWS_URL)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        news_block = soup.find("div", class_="vfsg-news-content")
+        return news_block.text.strip() if news_block else None
     except Exception as e:
-        logger.error(f"Ошибка отправки в Telegram: {e}")
-
-def fetch_news_text():
-    try:
-        r = scraper.get(NEWS_URL, timeout=15)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        logger.warning(f"Ошибка при получении новости: {e}")
+        logging.warning(f"Ошибка при получении новости: {e}")
         return None
 
-def extract_snippet(html_text, length=800):
-    # Убираем HTML теги
-    text_only = re.sub('<[^<]+?>', '', html_text)
-    text_only = text_only.strip().replace('\n', ' ').replace('\r', '')
-    text_only = html.unescape(text_only)  # преобразуем HTML-сущности
-    snippet = text_only[:length]
-    return snippet + ("..." if len(text_only) > length else "")
-
-def check_news(manual=False):
-    global last_news_text
-    logger.info("Проверка новостей...")
-    text = fetch_news_text()
-    if text is None:
-        return
-    if last_news_text != text:
-        last_news_text = text
-        snippet = extract_snippet(text)
-        msg = f"🆕 Новая новость VFS Global:\n\n{snippet}\n\n{NEWS_URL}"
-        send_telegram(msg)
+def check_news():
+    global last_news_hash
+    logging.info("Проверка новостей...")
+    news_text = fetch_news()
+    if news_text:
+        current_hash = hash(news_text)
+        if current_hash != last_news_hash:
+            last_news_hash = current_hash
+            send_telegram_message(f"🆕 Обновление на VFS: \n\n{news_text}")
+        else:
+            logging.info("Новостей нет")
     else:
-        if manual:
-            send_telegram("Нет новых новостей.")
-        logger.info("Новостей не обнаружено.")
+        logging.info("Не удалось получить новости.")
 
-def auto_check_loop():
-    def loop():
-        while True:
-            try:
-                check_news()
-            except Exception as e:
-                logger.error(f"Ошибка в авто-проверке: {e}")
-            time.sleep(CHECK_INTERVAL * 60)
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
+def send_telegram_message(message):
+    try:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        logging.info("Отправлено сообщение в Telegram")
+    except Exception as e:
+        logging.error(f"Ошибка отправки в Telegram: {e}")
 
-@app.route("/")
-def health():
-    return "VFS News Bot работает", 200
+# Команды Telegram
+def start(update: Update, context):
+    update.message.reply_text("✅ Бот запущен и следит за новостями.")
 
+def status(update: Update, context):
+    update.message.reply_text("🟢 Бот работает.")
+
+def check(update: Update, context):
+    update.message.reply_text("🔄 Ручная проверка...")
+    check_news()
+
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("status", status))
+dispatcher.add_handler(CommandHandler("check", check))
+
+# Webhook
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def telegram_webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
-    message = update.message
-    if not message:
-        return "ok", 200
-    chat_id = message.chat.id
-    text = message.text or ""
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "OK"
 
-    if str(chat_id) != str(TELEGRAM_CHAT_ID):
-        logger.warning(f"Сообщение от незарегистрированного chat_id: {chat_id}")
-        return "ok", 200
+# Health-check
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
 
-    text_lower = text.strip().lower()
-
-    if text_lower == "/start":
-        send_telegram("Привет! Я слежу за новостями VFS Global.\nКоманды:\n/start\n/check\n/status\n/help")
-    elif text_lower == "/check":
-        check_news(manual=True)
-    elif text_lower == "/status":
-        from datetime import datetime
-        now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        send_telegram(f"📡 Бот работает.\nТекущее время: {now}")
-    elif text_lower == "/help":
-        send_telegram("/start - Приветствие\n/check - Проверить новости\n/status - Статус бота\n/help - Помощь")
-    else:
-        send_telegram("Неизвестная команда. Напиши /help.")
-
-    return "ok", 200
+# Запуск автоматической проверки в отдельном потоке
+def background_news_check():
+    import time
+    while True:
+        check_news()
+        time.sleep(60 * 5)  # каждые 5 минут
 
 if __name__ == "__main__":
-    logger.info("Бот запущен, стартуем авто-проверку...")
-    auto_check_loop()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    Thread(target=background_news_check, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
