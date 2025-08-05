@@ -1,112 +1,103 @@
 import os
 import time
 import logging
-import json
 import threading
-import cloudscraper
-from datetime import datetime
+import requests
 from flask import Flask, request
-import telegram
 
-# === Конфигурация ===
+# --- Конфигурация ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL", 60))
+CHECK_INTERVAL = 60 * 60  # 60 минут
 
-CITIES = {
-    "91": "Минск",
-    "92": "Гомель",
-    "93": "Могилёв",
-    "94": "Витебск"
-}
+NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-# Логирование
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-# Телеграм бот
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
-
-# Flask приложение
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# cloudscraper с обходом защиты
-scraper = cloudscraper.create_scraper()
+last_news_text = None  # хранит последний текст новости
 
-# === Проверка слотов ===
-def check_slots():
-    logger.info("Проверка доступности слотов...")
-    found = False
-    messages = []
-    for city_id, city_name in CITIES.items():
-        try:
-            url = f"https://visa.vfsglobal.com/bel/ru/pol/book-appointment/api/slots/availability?city_id={city_id}&category_id=50&sub_category_id=676"
-            r = scraper.get(url)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("available"):
-                    logger.info(f"✅ Слот найден: {city_name}")
-                    messages.append(f"✅ Слот доступен в городе *{city_name}*")
-                    found = True
-                else:
-                    logger.info(f"❌ Нет слота: {city_name}")
-            else:
-                logger.warning(f"⚠️ Ошибка при запросе {city_name}: {r.status_code}")
-        except Exception as e:
-            logger.error(f"⚠️ Ошибка при проверке {city_name}: {str(e)}")
-
-    if found:
-        send_telegram("\n".join(messages))
-    else:
-        logger.info("Слоты не найдены.")
-
-# === Telegram уведомление ===
-def send_telegram(text):
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
-        logger.info("📨 Уведомление отправлено в Telegram")
+        r = requests.post(url, json=payload)
+        r.raise_for_status()
+        logging.info("Отправлено в Telegram")
     except Exception as e:
-        logger.error(f"Ошибка отправки в Telegram: {e}")
+        logging.warning(f"Ошибка отправки в Telegram: {e}")
 
-# === Автоматическая проверка ===
-def start_loop():
+def fetch_news_text():
+    try:
+        r = requests.get(NEWS_URL, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        logging.warning(f"Ошибка при получении новости: {e}")
+        return None
+
+def check_news():
+    global last_news_text
+    logging.info("Проверяем новости на сайте...")
+    text = fetch_news_text()
+    if text is None:
+        return
+
+    # Простая проверка: если содержимое изменилось — считаем новой новостью
+    if last_news_text != text:
+        last_news_text = text
+        snippet = extract_snippet(text)
+        message = f"🆕 Новая новость с VFS Global:\n\n{snippet}\n\n{NEWS_URL}"
+        send_telegram(message)
+        logging.info("Новая новость найдена и отправлена.")
+    else:
+        logging.info("Новостей не обнаружено.")
+
+def extract_snippet(html_text, length=500):
+    # Просто отрезаем первые length символов без HTML тэгов
+    import re
+    text_only = re.sub('<[^<]+?>', '', html_text)
+    snippet = text_only.strip().replace('\n', ' ')[:length]
+    return snippet + ("..." if len(text_only) > length else "")
+
+def auto_check_loop():
     def loop():
         while True:
             try:
-                check_slots()
+                check_news()
             except Exception as e:
-                logger.error(f"❌ Ошибка в цикле: {e}")
-            time.sleep(CHECK_INTERVAL_MINUTES * 60)
-
+                logging.error(f"Ошибка в авто-проверке: {e}")
+            time.sleep(CHECK_INTERVAL)
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
 
-# === Webhook обработчик ===
+@app.route("/")
+def health():
+    return "VFS News Bot работает", 200
+
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
-    chat_id = update.message.chat.id
-    text = update.message.text.strip().lower()
+def telegram_webhook():
+    update = request.get_json(force=True)
+    message = update.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text", "")
+
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        return "ok", 200
 
     if text == "/start":
-        bot.send_message(chat_id=chat_id, text="🤖 Бот запущен. Проверяю слоты каждый час.")
+        send_telegram("Привет! Я слежу за новостями VFS Global. Напиши /check чтобы проверить новости сейчас.")
     elif text == "/check":
-        bot.send_message(chat_id=chat_id, text="🔍 Ручная проверка слотов...")
-        check_slots()
-    elif text == "/status":
-        now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-        bot.send_message(chat_id=chat_id, text=f"📡 Бот работает. Текущее время: {now}")
+        check_news()
+    elif text == "/help":
+        send_telegram("/start - Запуск бота\n/check - Проверить новости\n/help - Помощь")
     else:
-        bot.send_message(chat_id=chat_id, text="Неизвестная команда. Используй /start, /check, /status")
-    return "ok"
+        send_telegram("Неизвестная команда. Напиши /help.")
 
-# === Health-check для Railway ===
-@app.route("/", methods=["GET"])
-def root():
-    return "✅ VFS бот работает"
+    return "ok", 200
 
-# === Запуск ===
 if __name__ == "__main__":
-    logger.info("🚀 Бот запущен.")
-    start_loop()
+    logging.info("Бот запущен, старт авто-проверки...")
+    auto_check_loop()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
