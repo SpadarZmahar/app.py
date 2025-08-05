@@ -1,115 +1,108 @@
 import os
-import time
-import threading
-import requests
-from flask import Flask, jsonify, request
+import logging
+import cloudscraper
 from bs4 import BeautifulSoup
-from datetime import datetime
+from flask import Flask, request
+import threading
+import time
+import datetime
+import telegram
 
-# === Настройки ===
-NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-STATE_FILE = "last_news.txt"
-CHECK_INTERVAL = 3600  # 1 час
-app = Flask(__name__)
-
-# === Telegram ===
+# Настройки
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+CHECK_INTERVAL = 3600  # каждый час
 
-# === Состояние бота ===
-monitoring_enabled = True
-last_news = ""
+# Инициализация
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
+app = Flask(__name__)
+scraper = cloudscraper.create_scraper()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-def read_saved_news():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return ""
+# Хранение последней новости
+last_news = {"title": "", "url": ""}
 
-def save_news(news_text):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        f.write(news_text)
 
-def fetch_latest_news():
-    try:
-        resp = requests.get(NEWS_URL, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        article = soup.select_one("div.card-text")
-        return article.get_text(strip=True) if article else None
-    except Exception as e:
-        print(f"[Ошибка] Не удалось получить новость: {e}")
-        return None
-
-def send_telegram_message(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Ошибка] Не заданы TELEGRAM_TOKEN или TELEGRAM_CHAT_ID")
-        return
-    requests.post(f"{TELEGRAM_API}/sendMessage", data={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
-    })
-
-def monitor_loop():
+def check_news():
     global last_news
     while True:
-        if monitoring_enabled:
-            current = fetch_latest_news()
-            if current and current != last_news:
-                last_news = current
-                save_news(current)
-                msg = f"🆕 Новая новость на VFS:\n\n{current}\n\n{NEWS_URL}"
-                print("[Бот] Отправка новости в Telegram")
-                send_telegram_message(msg)
+        try:
+            url = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            response = scraper.get(url, headers=headers)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            news_block = soup.find("div", class_="card-body p-0 news-article")
+            if news_block:
+                title = news_block.find("h5").text.strip()
+                link = "https://visa.vfsglobal.com" + news_block.find("a")["href"]
+                if title != last_news["title"]:
+                    last_news = {"title": title, "url": link}
+                    message = f"🆕 Новая новость!\n\n<b>{title}</b>\n{link}"
+                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="HTML")
+                    logging.info("Найдена новая новость и отправлена в Telegram")
+                else:
+                    logging.info("Новых новостей нет")
             else:
-                print("[Бот] Нет новых новостей")
+                logging.warning("Блок с новостью не найден")
+
+        except Exception as e:
+            logging.error(f"[Ошибка] Не удалось получить новость: {e}")
         time.sleep(CHECK_INTERVAL)
 
-@app.route("/")
-def index():
-    return jsonify({
-        "status": "running",
-        "monitoring": monitoring_enabled,
-        "last_checked": datetime.utcnow().isoformat(),
-        "last_news": last_news
-    })
 
-@app.route("/health")
-def health():
-    return "OK", 200
+@app.route("/")
+def home():
+    return f"<h2>VFS News Bot</h2><p>Последняя новость: <b>{last_news['title']}</b><br><a href='{last_news['url']}'>{last_news['url']}</a></p>"
+
+
+@app.route("/check", methods=["GET"])
+def manual_check():
+    threading.Thread(target=check_news_once).start()
+    return "Проверка запущена вручную."
+
 
 @app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
 def telegram_webhook():
-    global monitoring_enabled
-    data = request.get_json()
-    message = data.get("message", {})
-    text = message.get("text", "")
-    chat_id = str(message.get("chat", {}).get("id"))
+    update = telegram.Update.de_json(request.get_json(force=True), bot)
+    chat_id = update.message.chat.id
+    text = update.message.text.lower()
 
-    if chat_id != TELEGRAM_CHAT_ID:
-        return "Unauthorized", 403
+    if "проверь" in text or "check" in text:
+        bot.send_message(chat_id=chat_id, text="🔄 Проверяю новости...")
+        threading.Thread(target=check_news_once).start()
+    elif "статус" in text or "status" in text:
+        bot.send_message(chat_id=chat_id, text=f"📝 Последняя новость:\n<b>{last_news['title']}</b>\n{last_news['url']}", parse_mode="HTML")
+    else:
+        bot.send_message(chat_id=chat_id, text="Команды:\n• статус\n• проверь")
 
-    if text == "/start":
-        monitoring_enabled = True
-        send_telegram_message("✅ Мониторинг включен")
-    elif text == "/stop":
-        monitoring_enabled = False
-        send_telegram_message("⛔️ Мониторинг остановлен")
-    elif text == "/check":
-        latest = fetch_latest_news()
-        send_telegram_message(f"📰 Последняя новость:\n\n{latest}")
-    elif text == "/status":
-        send_telegram_message("ℹ️ Бот работает.\nМониторинг: " +
-                              ("включён" if monitoring_enabled else "выключен"))
-    return "OK", 200
+    return "OK"
 
-def start_bot():
-    global last_news
-    last_news = read_saved_news()
-    thread = threading.Thread(target=monitor_loop, daemon=True)
-    thread.start()
+
+def check_news_once():
+    try:
+        url = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = scraper.get(url, headers=headers)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        news_block = soup.find("div", class_="card-body p-0 news-article")
+        if news_block:
+            title = news_block.find("h5").text.strip()
+            link = "https://visa.vfsglobal.com" + news_block.find("a")["href"]
+            if title != last_news["title"]:
+                last_news.update({"title": title, "url": link})
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🆕 Новая новость!\n\n<b>{title}</b>\n{link}", parse_mode="HTML")
+            else:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Новостей пока нет.")
+        else:
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="❗ Блок с новостями не найден.")
+    except Exception as e:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Ошибка: {e}")
+
 
 if __name__ == "__main__":
-    start_bot()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    threading.Thread(target=check_news).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
