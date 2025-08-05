@@ -71,65 +71,80 @@ def fetch_news():
             'Sec-Fetch-Dest': 'document'
         }
         
-        response = scraper.get(NEWS_URL, headers=headers, timeout=60)
+        # Увеличиваем таймаут и добавляем параметры для обхода Cloudflare
+        response = scraper.get(
+            NEWS_URL,
+            headers=headers,
+            timeout=60,
+            allow_redirects=True
+        )
         response.raise_for_status()
+
+        # Проверяем, не получили ли мы страницу Cloudflare
+        if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
+            logging.warning("Обнаружена страница проверки Cloudflare")
+            # Попробуем получить данные через альтернативный метод
+            return fetch_news_alternative()
 
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Улучшенный поиск новостного блока
-        news_block = None
+        # Попробуем найти JSON-данные в скриптах
+        script_data = soup.find_all('script', type='application/ld+json')
+        for script in script_data:
+            if '"@type":"NewsArticle"' in script.text:
+                logging.info("Найден скрипт с данными новости")
+                # Упрощенный парсинг JSON
+                if '"headline"' in script.text and '"articleBody"' in script.text:
+                    headline_start = script.text.find('"headline":') + 12
+                    headline_end = script.text.find('",', headline_start)
+                    headline = script.text[headline_start:headline_end]
+                    
+                    body_start = script.text.find('"articleBody":') + 15
+                    body_end = script.text.find('"', body_start)
+                    body = script.text[body_start:body_end]
+                    
+                    return f"{headline}\n\n{body}"
+
+        # Если не нашли в скриптах, попробуем основной контент
+        main_content = soup.find('main') or soup.find('div', role='main')
+        if main_content:
+            logging.info("Найден основной контент страницы")
+            news_text = main_content.get_text(separator="\n", strip=True)
+            news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
+            return news_text
         
-        # Попробуем разные стратегии поиска
-        selectors = [
-            "div.vfsg-news-content",        # Старый селектор
-            "div.vfsg-content",             # Альтернативный класс
-            "div.vfsweb-container",         # Новый контейнер
-            "section.vfsg-news",            # Возможный тег section
-            "div.news-content",             # Общий класс
-            "div.announcement",             # Другой возможный класс
-            "div.content-main",             # Основной контент
-            "div.page-content",             # Контент страницы
-            "div#main-content",             # ID основного контента
-            "article.news-item"             # Тег article
-        ]
-        
-        for selector in selectors:
-            news_block = soup.select_one(selector)
-            if news_block:
-                logging.info(f"Найден блок с селектором: {selector}")
-                break
-        
-        # Если не нашли по селекторам, попробуем найти по тексту
-        if not news_block:
-            logging.warning("Поиск по селекторам не дал результатов, пробуем поиск по тексту")
-            possible_blocks = soup.find_all(["div", "section", "article"])
-            for block in possible_blocks:
-                text = block.text.lower()
-                if "новост" in text or "объявлени" in text or "release" in text or "appointment" in text:
-                    news_block = block
-                    logging.info("Блок найден по текстовому содержанию")
-                    break
-        
-        if not news_block:
-            logging.error("Не удалось найти новостной блок на странице. Сохраняем HTML для отладки...")
-            # Сохраняем HTML для анализа
-            with open("page_dump.html", "w", encoding="utf-8") as f:
-                f.write(response.text)
-            return None
-        
-        # Очищаем и форматируем текст
-        news_text = news_block.get_text(separator="\n", strip=True)
-        news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
-        
-        # Удаляем лишние элементы
-        unwanted_phrases = ["cookie policy", "политика использования файлов cookie", "© copyright"]
-        for phrase in unwanted_phrases:
-            news_text = news_text.replace(phrase, "")
-        
-        return news_text.strip()
+        logging.error("Не удалось найти новостной блок на странице")
+        return None
 
     except Exception as e:
         logging.error(f"Ошибка при получении новостей: {str(e)}")
+        return None
+
+def fetch_news_alternative():
+    """Альтернативный метод получения новостей для обхода Cloudflare"""
+    try:
+        # Пробуем получить мобильную версию сайта
+        mobile_url = NEWS_URL.replace("//visa.", "//m.visa.")  # Может работать для некоторых сайтов
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.210 Mobile Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        }
+        
+        response = scraper.get(mobile_url, headers=headers, timeout=60)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, "html.parser")
+        content = soup.find('div', class_='content') or soup.find('article')
+        
+        if content:
+            news_text = content.get_text(separator="\n", strip=True)
+            news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
+            return news_text
+        
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка в альтернативном методе: {str(e)}")
         return None
 
 def send_telegram_message(message):
