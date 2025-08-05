@@ -27,11 +27,15 @@ def get_env_var(name):
 
 TELEGRAM_TOKEN = get_env_var("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = get_env_var("TELEGRAM_CHAT_ID")
-WEBHOOK_URL = get_env_var("WEBHOOK_URL")  # Базовый URL вебхука
+
+# WEBHOOK_URL теперь опциональная переменная
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+if not WEBHOOK_URL:
+    logging.warning("WEBHOOK_URL не задан. Вебхук не будет настроен автоматически")
 
 # Конфигурация
 NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-CHECK_INTERVAL_SECONDS = 60 * 5  # 5 минут
+CHECK_INTERVAL_SECONDS = 60 * 60  # 1 час
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
@@ -60,20 +64,51 @@ def fetch_news():
             'Cache-Control': 'no-cache',
             'Pragma': 'no-cache',
             'DNT': '1',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-User': '?1',
+            'Sec-Fetch-Dest': 'document'
         }
         
-        response = scraper.get(NEWS_URL, headers=headers, timeout=30)
+        response = scraper.get(NEWS_URL, headers=headers, timeout=45)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Попробуем найти новости разными способами
         news_block = soup.find("div", class_="vfsg-news-content")
-
+        
+        # Если не нашли по старому классу, пробуем новые варианты
         if not news_block:
-            logging.warning("Новостной блок 'vfsg-news-content' не найден")
+            news_block = soup.find("div", class_="vfsg-content")
+        
+        if not news_block:
+            news_block = soup.find("div", class_="vfsweb-container")
+        
+        if not news_block:
+            news_block = soup.select_one(".vfsweb-row .vfsweb-col")
+        
+        # Последняя попытка: ищем по текстовому содержанию
+        if not news_block:
+            possible_blocks = soup.find_all(["div", "section"])
+            for block in possible_blocks:
+                if "новост" in block.text.lower() or "release" in block.text.lower():
+                    news_block = block
+                    break
+        
+        if not news_block:
+            logging.error("Не удалось найти новостной блок на странице")
+            # Сохраняем HTML для отладки
+            with open("page_dump.html", "w", encoding="utf-8") as f:
+                f.write(response.text)
             return None
             
-        return news_block.text.strip()
+        # Очищаем текст от лишних пробелов
+        news_text = news_block.text.strip()
+        news_text = "\n".join([line.strip() for line in news_text.split("\n") if line.strip()])
+        
+        return news_text
 
     except Exception as e:
         logging.error(f"Ошибка при получении новостей: {str(e)}")
@@ -123,7 +158,10 @@ def start_command(update: Update, context: CallbackContext):
 def status_command(update: Update, context: CallbackContext):
     status = "🟢 Бот работает\n"
     status += f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-    status += "✅ Вебхук настроен" if WEBHOOK_URL else "⚠️ Вебхук не настроен"
+    if WEBHOOK_URL:
+        status += "✅ Вебхук настроен"
+    else:
+        status += "⚠️ Вебхук не настроен"
     update.message.reply_text(status)
 
 def check_command(update: Update, context: CallbackContext):
@@ -136,7 +174,6 @@ dispatcher.add_handler(CommandHandler("start", start_command))
 dispatcher.add_handler(CommandHandler("status", status_command))
 dispatcher.add_handler(CommandHandler("check", check_command))
 
-# --- ВЕБ-СЕРВЕР И ФОНОВЫЕ ЗАДАЧИ ---
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     """Endpoint для обработки обновлений Telegram"""
@@ -150,14 +187,17 @@ def health_check():
     return "OK", 200
 
 def setup_webhook():
-    """Настройка вебхука Telegram"""
+    """Настройка вебхука Telegram (только если WEBHOOK_URL задан)"""
+    if not WEBHOOK_URL:
+        logging.warning("WEBHOOK_URL не задан. Пропускаю настройку вебхука")
+        return
+        
     webhook_path = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
     try:
         bot.set_webhook(url=webhook_path)
         logging.info(f"Вебхук установлен: {webhook_path}")
     except Exception as e:
         logging.error(f"Ошибка настройки вебхука: {str(e)}")
-        raise
 
 def background_news_checker():
     """Фоновая проверка новостей"""
@@ -173,7 +213,7 @@ def background_news_checker():
             time.sleep(60)
 
 if __name__ == "__main__":
-    # Настройка вебхука
+    # Настройка вебхука (если URL задан)
     setup_webhook()
     
     # Запуск фонового потока
