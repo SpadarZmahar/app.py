@@ -35,7 +35,7 @@ if not WEBHOOK_URL:
 
 # Конфигурация
 NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-CHECK_INTERVAL_SECONDS = 60 * 60  # 1 час
+CHECK_INTERVAL_SECONDS = 60 * 60  # 1 час (60 минут)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
@@ -71,44 +71,62 @@ def fetch_news():
             'Sec-Fetch-Dest': 'document'
         }
         
-        response = scraper.get(NEWS_URL, headers=headers, timeout=45)
+        response = scraper.get(NEWS_URL, headers=headers, timeout=60)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Попробуем найти новости разными способами
-        news_block = soup.find("div", class_="vfsg-news-content")
+        # Улучшенный поиск новостного блока
+        news_block = None
         
-        # Если не нашли по старому классу, пробуем новые варианты
-        if not news_block:
-            news_block = soup.find("div", class_="vfsg-content")
+        # Попробуем разные стратегии поиска
+        selectors = [
+            "div.vfsg-news-content",        # Старый селектор
+            "div.vfsg-content",             # Альтернативный класс
+            "div.vfsweb-container",         # Новый контейнер
+            "section.vfsg-news",            # Возможный тег section
+            "div.news-content",             # Общий класс
+            "div.announcement",             # Другой возможный класс
+            "div.content-main",             # Основной контент
+            "div.page-content",             # Контент страницы
+            "div#main-content",             # ID основного контента
+            "article.news-item"             # Тег article
+        ]
         
-        if not news_block:
-            news_block = soup.find("div", class_="vfsweb-container")
+        for selector in selectors:
+            news_block = soup.select_one(selector)
+            if news_block:
+                logging.info(f"Найден блок с селектором: {selector}")
+                break
         
+        # Если не нашли по селекторам, попробуем найти по тексту
         if not news_block:
-            news_block = soup.select_one(".vfsweb-row .vfsweb-col")
-        
-        # Последняя попытка: ищем по текстовому содержанию
-        if not news_block:
-            possible_blocks = soup.find_all(["div", "section"])
+            logging.warning("Поиск по селекторам не дал результатов, пробуем поиск по тексту")
+            possible_blocks = soup.find_all(["div", "section", "article"])
             for block in possible_blocks:
-                if "новост" in block.text.lower() or "release" in block.text.lower():
+                text = block.text.lower()
+                if "новост" in text or "объявлени" in text or "release" in text or "appointment" in text:
                     news_block = block
+                    logging.info("Блок найден по текстовому содержанию")
                     break
         
         if not news_block:
-            logging.error("Не удалось найти новостной блок на странице")
-            # Сохраняем HTML для отладки
+            logging.error("Не удалось найти новостной блок на странице. Сохраняем HTML для отладки...")
+            # Сохраняем HTML для анализа
             with open("page_dump.html", "w", encoding="utf-8") as f:
                 f.write(response.text)
             return None
-            
-        # Очищаем текст от лишних пробелов
-        news_text = news_block.text.strip()
-        news_text = "\n".join([line.strip() for line in news_text.split("\n") if line.strip()])
         
-        return news_text
+        # Очищаем и форматируем текст
+        news_text = news_block.get_text(separator="\n", strip=True)
+        news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
+        
+        # Удаляем лишние элементы
+        unwanted_phrases = ["cookie policy", "политика использования файлов cookie", "© copyright"]
+        for phrase in unwanted_phrases:
+            news_text = news_text.replace(phrase, "")
+        
+        return news_text.strip()
 
     except Exception as e:
         logging.error(f"Ошибка при получении новостей: {str(e)}")
