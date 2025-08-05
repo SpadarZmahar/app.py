@@ -1,81 +1,83 @@
 import os
+import time
+import json
 import logging
+import threading
 import requests
 from flask import Flask, request
 
-# Настройка логов
+# Конфигурация
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
+CHECK_INTERVAL = 60 * 60  # 60 минут
+
+app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# Переменные окружения
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ваш_токен_бота")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ваш_чат_id")
-PORT = int(os.getenv("PORT", 8080))
+VFSGLOBAL_NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
+VFS_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
-# Flask-приложение
-app = Flask(__name__)
-
-# Храним последнюю новость
 last_news = ""
 
-# Проверка новостей на VFS Global
-def check_news():
-    global last_news
+def send_telegram_message(text):
     try:
-        url = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        response = requests.post(url, json=payload)
         response.raise_for_status()
-        if "Внимание!" in response.text or "назначения" in response.text:
-            message = "🛂 Найдена новая новость на VFS Global!"
-            if message != last_news:
-                send_telegram(message)
-                last_news = message
-                logging.info("[Найдено] %s", message)
-            return message
-        else:
-            return "Нет новых новостей."
+        logging.info("[Telegram] Сообщение отправлено")
     except Exception as e:
-        error_msg = f"[Ошибка] Не удалось получить новость: {e}"
-        logging.warning(error_msg)
-        return error_msg
+        logging.error(f"[Telegram] Ошибка отправки: {e}")
 
-# Отправка в Telegram
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def fetch_news():
+    headers = {"User-Agent": VFS_USER_AGENT}
     try:
-        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
-        if resp.status_code != 200:
-            logging.warning("Ошибка Telegram: %s", resp.text)
+        response = requests.get(VFSGLOBAL_NEWS_URL, headers=headers, timeout=10)
+        response.raise_for_status()
+        if "запись на подачу документов" in response.text.lower():
+            return "🆕 Обнаружена новая новость: запись открыта!"
+        else:
+            return None
     except Exception as e:
-        logging.warning("Ошибка при отправке в Telegram: %s", e)
+        logging.error(f"[Ошибка] Не удалось получить новость: {e}")
+        return None
 
-# Webhook-обработчик
-@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
-    if request.method == "POST":
-        data = request.json
-        if "message" in data:
-            chat_id = data["message"]["chat"]["id"]
-            text = data["message"].get("text", "")
-            if text == "/start":
-                send_telegram("✅ Бот запущен.")
-            elif text == "/check":
-                result = check_news()
-                send_telegram(result)
-            elif text == "/status":
-                send_telegram(last_news or "Новостей пока не было.")
-            elif text == "/help":
-                help_text = "Команды:\n/start — запуск\n/check — проверка\n/status — статус\n/help — помощь"
-                send_telegram(help_text)
-            else:
-                send_telegram("Неизвестная команда. Напиши /help.")
-    return "ok"
+def check_and_notify():
+    global last_news
+    logging.info("[Бот] Проверка новостей...")
+    news = fetch_news()
+    if news and news != last_news:
+        send_telegram_message(news)
+        last_news = news
+    else:
+        logging.info("[Бот] Нет новых новостей")
+    # Запланировать следующую проверку
+    threading.Timer(CHECK_INTERVAL, check_and_notify).start()
 
-# Health-check
 @app.route("/")
-def index():
-    return "VFS Telegram Bot работает."
+def health():
+    return "VFS Bot работает", 200
 
-# Запуск сервера
+@app.route(f"/{WEBHOOK_SECRET}", methods=["POST"])
+def telegram_webhook():
+    data = request.json
+    logging.info(f"[Webhook] Получено сообщение: {data}")
+    if "message" in data and "text" in data["message"]:
+        chat_id = data["message"]["chat"]["id"]
+        text = data["message"]["text"]
+        if str(chat_id) != TELEGRAM_CHAT_ID:
+            logging.warning("[Webhook] Сообщение от неизвестного chat_id")
+            return "OK", 200
+        if text == "/check":
+            news = fetch_news()
+            if news:
+                send_telegram_message(news)
+            else:
+                send_telegram_message("Нет новых новостей.")
+    return "OK", 200
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    logging.info("[Бот] Запуск...")
+    check_and_notify()  # Старт автопроверки
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
