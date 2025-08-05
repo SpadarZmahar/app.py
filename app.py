@@ -5,6 +5,8 @@ import threading
 import cloudscraper
 from flask import Flask, request
 import telegram
+import html
+import re
 
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -24,7 +26,7 @@ last_news_text = None
 
 def send_telegram(message):
     try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)  # без parse_mode
         logger.info("Отправлено сообщение в Telegram")
     except Exception as e:
         logger.error(f"Ошибка отправки в Telegram: {e}")
@@ -38,10 +40,12 @@ def fetch_news_text():
         logger.warning(f"Ошибка при получении новости: {e}")
         return None
 
-def extract_snippet(html_text, length=500):
-    import re
+def extract_snippet(html_text, length=800):
+    # Убираем HTML теги
     text_only = re.sub('<[^<]+?>', '', html_text)
-    snippet = text_only.strip().replace('\n', ' ')[:length]
+    text_only = text_only.strip().replace('\n', ' ').replace('\r', '')
+    text_only = html.unescape(text_only)  # преобразуем HTML-сущности
+    snippet = text_only[:length]
     return snippet + ("..." if len(text_only) > length else "")
 
 def check_news(manual=False):
@@ -53,7 +57,7 @@ def check_news(manual=False):
     if last_news_text != text:
         last_news_text = text
         snippet = extract_snippet(text)
-        msg = f"🆕 *Новая новость VFS Global:*\n\n{snippet}\n\n[Перейти к новости]({NEWS_URL})"
+        msg = f"🆕 Новая новость VFS Global:\n\n{snippet}\n\n{NEWS_URL}"
         send_telegram(msg)
     else:
         if manual:
