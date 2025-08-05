@@ -22,7 +22,8 @@ def check_news():
     global last_news
     try:
         url = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-        response = requests.get(url, timeout=10)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         if "Внимание!" in response.text or "назначения" in response.text:
             message = "🛂 Найдена новая новость на VFS Global!"
