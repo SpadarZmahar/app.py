@@ -1,9 +1,8 @@
-flask
-requests
-beautifulsoup4
-python-telegram-bot==13.15
-cloudscraper
-gunicorn
+Flask==3.0.3
+requests==2.31.0
+beautifulsoup4==4.12.3
+python-telegram-bot==20.6
+cloudscraper==1.2.74
 selenium==4.19.0
 webdriver-manager==4.0.1
 Pillow==10.3.0
