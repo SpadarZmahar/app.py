@@ -1,52 +1,40 @@
 # Используем официальный образ Python
 FROM python:3.11-slim
 
-# Установка последней версии setuptools
-RUN pip install --no-cache-dir --upgrade setuptools
-
-# Устанавливаем системные зависимости
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Устанавливаем необходимые утилиты
+RUN apt-get update && apt-get install -y \
     wget \
-    gnupg \
-    ca-certificates \
     curl \
     unzip \
+    gnupg \
+    ca-certificates \
     fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libatspi2.0-0 \
-    libcairo2 \
-    libcups2 \
-    libdbus-1-3 \
-    libdrm2 \
-    libgbm1 \
-    libglib2.0-0 \
-    libgtk-3-0 \
-    libnspr4 \
     libnss3 \
-    libpango-1.0-0 \
-    libx11-6 \
-    libxcb1 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libx11-xcb1 \
     libxcomposite1 \
     libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxkbcommon0 \
     libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpangocairo-1.0-0 \
+    libpango-1.0-0 \
+    libgtk-3-0 \
+    libxss1 \
     xdg-utils \
-    && rm -rf /var/lib/apt/lists/*
+    --no-install-recommends
 
-# Установка Chrome
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg && \
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
-    apt-get update && \
-    apt-get install -y google-chrome-stable && \
-    rm -rf /var/lib/apt/lists/*
+# Добавляем репозиторий Google Chrome и устанавливаем его
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
+    sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' && \
+    apt-get update && apt-get install -y google-chrome-stable
 
-# Установка ChromeDriver
-RUN CHROME_VERSION=$(google-chrome-stable --version | grep -oP '\d+\.\d+\.\d+') && \
+# Определяем переменные версии Chrome и ChromeDriver, скачиваем драйвер
+RUN CHROME_VERSION=$(google-chrome-stable --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') && \
     CHROME_MAJOR_VERSION=$(echo $CHROME_VERSION | cut -d'.' -f1) && \
     CHROMEDRIVER_VERSION=$(curl -s "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_$CHROME_MAJOR_VERSION") && \
     wget -q "https://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip" -O /tmp/chromedriver.zip && \
@@ -54,22 +42,23 @@ RUN CHROME_VERSION=$(google-chrome-stable --version | grep -oP '\d+\.\d+\.\d+') 
     chmod +x /usr/local/bin/chromedriver && \
     rm /tmp/chromedriver.zip
 
-# Настройка рабочей директории
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
 # Копируем зависимости
 COPY requirements.txt .
 
-# Устанавливаем зависимости
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Устанавливаем Python-зависимости
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем исходный код
+# Копируем весь код приложения в контейнер
 COPY . .
 
-# Устанавливаем переменные среды по умолчанию
-ENV PORT=8000
-ENV CHECK_INTERVAL_MINUTES=60
+# Экспортируем переменную окружения для headless Chrome
+ENV CHROME_BIN=/usr/bin/google-chrome-stable
 
-# Запускаем приложение
-CMD ["python", "app.py"]
+# Указываем порт, который будет слушать Flask
+ENV PORT=8000
+
+# Команда запуска приложения
+CMD ["python", "your_bot_file.py"]
