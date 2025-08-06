@@ -33,6 +33,7 @@ RUN apt-get update && \
     libxkbcommon0 \
     libxrandr2 \
     xdg-utils \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Установка Chrome
@@ -40,16 +41,17 @@ RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearm
     echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list && \
     apt-get update && \
     apt-get install -y google-chrome-stable && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
 # Настройка рабочей директории
 WORKDIR /app
 
-# Копируем зависимости
+# Сначала копируем только requirements.txt для кэширования
 COPY requirements.txt .
 
 # Устанавливаем зависимости
-RUN pip install --no-cache-dir --upgrade pip && \
+RUN pip install --no-cache-dir --upgrade pip==24.0 && \
     pip install --no-cache-dir -r requirements.txt
 
 # Копируем исходный код
