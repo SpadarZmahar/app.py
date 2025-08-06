@@ -1,23 +1,17 @@
-# -*- coding: utf-8 -*-
 import os
 import logging
 import time
 import hashlib
+import json
+import requests
 from threading import Thread, Lock
-import cloudscraper
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType
 from PIL import Image
 import io
-import json
-import requests
+import base64
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(
@@ -26,10 +20,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VFSMonitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("cloudscraper").setLevel(logging.WARNING)
-logging.getLogger("selenium").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("webdriver_manager").setLevel(logging.WARNING)
 
 # Проверка критических переменных среды
 def get_env_var(name, default=None):
@@ -42,12 +32,11 @@ def get_env_var(name, default=None):
 # Конфигурация
 TELEGRAM_TOKEN = get_env_var("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = get_env_var("TELEGRAM_CHAT_ID")
+SCRAPINGBEE_API_KEY = get_env_var("SCRAPINGBEE_API_KEY")
 NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
 WEBHOOK_URL = get_env_var("WEBHOOK_URL", "")
 CHECK_INTERVAL_MINUTES = int(get_env_var("CHECK_INTERVAL_MINUTES", "60"))
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 MAX_TEXT_LENGTH = 4000
-MAX_SCREENSHOT_ATTEMPTS = 2
 ERROR_NOTIFICATION_INTERVAL = 6 * 3600  # 6 часов между уведомлениями об ошибках
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
@@ -58,65 +47,31 @@ last_news_hash = None
 last_error_time = 0
 state_lock = Lock()
 
-# Инициализация CloudScraper
-scraper = cloudscraper.create_scraper(
-    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
-)
-
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def init_selenium_driver():
-    """Инициализирует headless Chrome для Selenium с автоматической установкой драйвера"""
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,720")
-    options.add_argument(f"user-agent={USER_AGENT}")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option('useAutomationExtension', False)
-    
-    # Автоматическая установка драйвера через webdriver-manager
-    service = Service(ChromeDriverManager(chrome_type=ChromeType.GOOGLE).install())
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
-
 def fetch_page_content():
-    """Получает содержимое страницы с обходом Cloudflare"""
-    max_attempts = 3
-    attempt = 0
-    delay = 15
+    """Получает содержимое страницы через ScrapingBee"""
+    params = {
+        'api_key': SCRAPINGBEE_API_KEY,
+        'url': NEWS_URL,
+        'render_js': 'true',  # Рендеринг JavaScript
+        'wait': 5000,         # Ожидание 5 секунд
+        'wait_for': '.content',  # Ожидание загрузки контента
+        'block_resources': 'false',  # Загрузка всех ресурсов
+        'custom_google': 'true',     # Оптимизация для сложных сайтов
+        'premium_proxy': 'true',     # Использование премиум-прокси
+        'country_code': 'us',        # Геолокация прокси
+        'transparent_status_code': 'true'  # Возврат реального статуса
+    }
     
-    while attempt < max_attempts:
-        attempt += 1
-        try:
-            logger.info(f"Попытка {attempt}/{max_attempts} получения страницы")
-            
-            headers = {
-                'User-Agent': USER_AGENT,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-                'DNT': '1',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-User': '?1',
-                'Sec-Fetch-Dest': 'document'
-            }
-            
-            response = scraper.get(NEWS_URL, headers=headers, timeout=30)
-            response.raise_for_status()
-
-            # Проверка на Cloudflare
-            if "cf-browser-verification" in response.text or "cloudflare" in response.text.lower():
-                logger.warning(f"Обнаружена страница проверки Cloudflare. Ожидание {delay} сек...")
-                time.sleep(delay)
-                delay *= 2
-                continue
-            
+    try:
+        response = requests.get(
+            'https://app.scrapingbee.com/api/v1/',
+            params=params,
+            timeout=60
+        )
+        
+        # Проверка статуса
+        if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
             
             # Удаляем ненужные элементы
@@ -143,72 +98,53 @@ def fetch_page_content():
                 page_text = page_text[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)"
             
             return page_text
-
-        except Exception as e:
-            logger.error(f"Ошибка при получении страницы (попытка {attempt}): {str(e)}")
-            time.sleep(delay)
-            delay *= 2
-    
-    logger.warning("Не удалось получить содержимое через requests. Пробуем Selenium...")
-    return fetch_with_selenium()
-
-def fetch_with_selenium():
-    """Использует Selenium для получения контента"""
-    driver = None
-    try:
-        driver = init_selenium_driver()
-        driver.get(NEWS_URL)
-        time.sleep(5)
-        
-        # Получение основного контента
-        content = driver.find_element("tag name", "body").text
-        return content[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)" if len(content) > MAX_TEXT_LENGTH else content
-    
+        else:
+            logger.error(f"Ошибка ScrapingBee: {response.status_code} - {response.text[:200]}")
+            return None
+            
     except Exception as e:
-        logger.error(f"Ошибка при получении страницы через Selenium: {str(e)}")
+        logger.error(f"Ошибка при получении страницы: {str(e)}")
         return None
-    
-    finally:
-        if driver:
-            driver.quit()
 
 def capture_screenshot():
-    """Делает скриншот страницы и возвращает как bytes"""
-    driver = None
-    attempt = 0
+    """Делает скриншот страницы через ScrapingBee"""
+    params = {
+        'api_key': SCRAPINGBEE_API_KEY,
+        'url': NEWS_URL,
+        'screenshot': 'true',          # Запрос скриншота
+        'screenshot_full_page': 'true', # Полностраничный скриншот
+        'wait': 3000,                   # Ожидание 3 секунды
+        'window_width': 1200,           # Ширина окна
+        'premium_proxy': 'true',        # Премиум прокси
+        'block_ads': 'true'             # Блокировка рекламы
+    }
     
-    while attempt < MAX_SCREENSHOT_ATTEMPTS:
-        attempt += 1
-        try:
-            driver = init_selenium_driver()
-            driver.get(NEWS_URL)
-            time.sleep(3)
-            
-            # Создание скриншота
-            screenshot = driver.get_screenshot_as_png()
-            
+    try:
+        response = requests.get(
+            'https://app.scrapingbee.com/api/v1/',
+            params=params,
+            timeout=60
+        )
+        
+        if response.status_code == 200:
             # Оптимизация размера
-            img = Image.open(io.BytesIO(screenshot))
+            img = Image.open(io.BytesIO(response.content))
             img = img.convert('RGB')
             output = io.BytesIO()
             img.save(output, format='JPEG', quality=80)
             return output.getvalue()
-        
-        except Exception as e:
-            logger.error(f"Ошибка при создании скриншота (попытка {attempt}): {str(e)}")
-            time.sleep(5)
-        
-        finally:
-            if driver:
-                driver.quit()
-    
-    return None
+        else:
+            logger.error(f"Ошибка получения скриншота: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Ошибка при создании скриншота: {str(e)}")
+        return None
 
 def send_telegram_message(message, image_bytes=None):
     """Отправляет сообщение и/или изображение в Telegram"""
     try:
         if image_bytes:
-            # Для длинных сообщений делаем обрезанный caption
             caption = message if len(message) <= 1000 else message[:900] + "\n\n... (сообщение сокращено)"
             bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
@@ -217,7 +153,6 @@ def send_telegram_message(message, image_bytes=None):
             )
             logger.info("Скриншот отправлен в Telegram")
         else:
-            # Разбиваем длинные сообщения на части
             if len(message) > 4000:
                 parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
                 for part in parts:
@@ -234,7 +169,7 @@ def calculate_hash(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest() if content else ""
 
 def save_state():
-    """Сохраняет состояние в файл (для сохранения при перезапусках)"""
+    """Сохраняет состояние в файл"""
     state = {
         'last_news_hash': last_news_hash,
         'last_error_time': last_error_time
@@ -274,7 +209,6 @@ def check_news_and_notify():
                 logger.warning("Не удалось получить содержимое страницы")
                 current_time = time.time()
                 
-                # Отправляем уведомление об ошибке не чаще чем раз в ERROR_NOTIFICATION_INTERVAL
                 if current_time - last_error_time > ERROR_NOTIFICATION_INTERVAL:
                     last_error_time = current_time
                     screenshot = capture_screenshot()
@@ -382,7 +316,7 @@ def health_check():
     }), 200
 
 def setup_webhook():
-    """Настройка вебхука Telegram (если URL задан)"""
+    """Настройка вебхука Telegram"""
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL не задан. Пропускаю настройку вебхука")
         return
@@ -420,7 +354,7 @@ def background_page_checker():
             time.sleep(300)  # Пауза 5 минут при ошибке
 
 if __name__ == "__main__":
-    # Настройка вебхука (если URL задан)
+    # Настройка вебхука
     setup_webhook()
     
     # Запуск фонового потока
