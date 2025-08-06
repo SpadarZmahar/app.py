@@ -1,7 +1,7 @@
 # Используем официальный образ Python
 FROM python:3.11-slim
 
-# Устанавливаем системные зависимости
+# Устанавливаем системные зависимости для Chrome
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     wget \
@@ -41,18 +41,6 @@ RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearm
     apt-get update && \
     apt-get install -y google-chrome-stable && \
     rm -rf /var/lib/apt/lists/*
-
-# Установка ChromeDriver (более надежный метод)
-RUN CHROME_MAJOR_VERSION=$(google-chrome-stable --version | sed -E 's/.* ([0-9]+)\.[0-9]+\.[0-9]+.*/\1/') && \
-    echo "Detected Chrome major version: $CHROME_MAJOR_VERSION" && \
-    CHROMEDRIVER_DOWNLOAD_URL=$(curl -sS "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json" | \
-    grep -Po "https://[^\"]+chromedriver-linux64.zip" | grep "stable" | grep "chrome-$CHROME_MAJOR_VERSION") && \
-    echo "Downloading ChromeDriver from: $CHROMEDRIVER_DOWNLOAD_URL" && \
-    wget -q "$CHROMEDRIVER_DOWNLOAD_URL" -O /tmp/chromedriver.zip && \
-    unzip /tmp/chromedriver.zip -d /usr/local/bin/ && \
-    mv /usr/local/bin/chromedriver-linux64/chromedriver /usr/local/bin/ && \
-    chmod +x /usr/local/bin/chromedriver && \
-    rm -rf /tmp/chromedriver.zip /usr/local/bin/chromedriver-linux64
 
 # Настройка рабочей директории
 WORKDIR /app
