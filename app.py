@@ -312,7 +312,7 @@ def run_flask():
 async def main():
     """Главная функция инициализации"""
     # Запускаем бота в фоне
-    await start_bot()
+    asyncio.create_task(start_bot())
     
     # Запускаем Flask в главном потоке
     run_flask()
