@@ -61,5 +61,5 @@ COPY . .
 ENV PORT=8000
 ENV CHECK_INTERVAL_MINUTES=60
 
-# Запускаем приложение
+# Запускаем приложение напрямую через Python
 CMD ["python", "app.py"]
