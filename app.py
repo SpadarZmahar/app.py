@@ -6,8 +6,8 @@ import json
 import requests
 from threading import Thread, Lock
 from flask import Flask, request
-from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler, CallbackContext
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
 from bs4 import BeautifulSoup
 from PIL import Image
 import io
@@ -40,11 +40,12 @@ ERROR_NOTIFICATION_INTERVAL = 6 * 3600  # 6 часов между уведомл
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 app = Flask(__name__)
-bot = Bot(token=TELEGRAM_TOKEN)
-dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 last_news_hash = None
 last_error_time = 0
 state_lock = Lock()
+
+# Создаем Application для Telegram
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def fetch_page_content():
@@ -136,12 +137,12 @@ def capture_screenshot():
         logger.error(f"Ошибка при создании скриншота: {str(e)}")
         return None
 
-def send_telegram_message(message, image_bytes=None):
+async def send_telegram_message(message, image_bytes=None):
     """Отправляет сообщение и/или изображение в Telegram"""
     try:
         if image_bytes:
             caption = message if len(message) <= 1000 else message[:900] + "\n\n... (сообщение сокращено)"
-            bot.send_photo(
+            await telegram_app.bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
                 photo=image_bytes,
                 caption=caption
@@ -151,10 +152,10 @@ def send_telegram_message(message, image_bytes=None):
             if len(message) > 4000:
                 parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
                 for part in parts:
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part)
+                    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part)
                     time.sleep(1)
             else:
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+                await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
             logger.info(f"Сообщение отправлено")
     except Exception as e:
         logger.error(f"Ошибка отправки в Telegram: {str(e)}")
@@ -189,7 +190,7 @@ def load_state():
         logger.error(f"Ошибка загрузения состояния: {str(e)}")
 
 # --- ОСНОВНАЯ ЛОГИКА ---
-def check_news_and_notify():
+async def check_news_and_notify():
     """Проверяет страницу и отправляет уведомления при изменениях"""
     global last_news_hash, last_error_time
     
@@ -206,7 +207,7 @@ def check_news_and_notify():
                 
                 if current_time - last_error_time > ERROR_NOTIFICATION_INTERVAL:
                     last_error_time = current_time
-                    send_telegram_message(
+                    await send_telegram_message(
                         f"⚠️ Ошибка получения страницы VFS!\n\n"
                         f"Ссылка: {NEWS_URL}\n"
                         f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}"
@@ -218,7 +219,7 @@ def check_news_and_notify():
             # Первый запуск
             if last_news_hash is None:
                 last_news_hash = current_hash
-                send_telegram_message(
+                await send_telegram_message(
                     f"✅ Бот запущен и начал мониторинг страницы VFS!\n\n"
                     f"Ссылка: {NEWS_URL}\n"
                     f"Интервал проверки: {CHECK_INTERVAL_MINUTES} минут\n\n"
@@ -230,7 +231,7 @@ def check_news_and_notify():
             # Обнаружены изменения
             if current_hash != last_news_hash:
                 last_news_hash = current_hash
-                send_telegram_message(
+                await send_telegram_message(
                     f"🆕 ОБНОВЛЕНИЕ НА СТРАНИЦЕ VFS!\n\n"
                     f"Ссылка: {NEWS_URL}\n"
                     f"Время обнаружения: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -246,9 +247,9 @@ def check_news_and_notify():
             return f"❌ Критическая ошибка: {str(e)}"
 
 # --- ОБРАБОТЧИКИ TELEGRAM ---
-def start_command(update: Update, context: CallbackContext):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /start"""
-    update.message.reply_text(
+    await update.message.reply_text(
         f"✅ Бот активен! Автоматически проверяю страницу VFS каждые {CHECK_INTERVAL_MINUTES} минут.\n"
         f"Ссылка: {NEWS_URL}\n\n"
         "Доступные команды:\n"
@@ -256,7 +257,7 @@ def start_command(update: Update, context: CallbackContext):
         "/check - запустить проверку вручную"
     )
 
-def status_command(update: Update, context: CallbackContext):
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /status"""
     status = "🟢 Бот работает\n"
     status += f"Проверяемая страница: {NEWS_URL}\n"
@@ -273,26 +274,27 @@ def status_command(update: Update, context: CallbackContext):
     else:
         status += "🔄 Ожидание первой проверки"
     
-    update.message.reply_text(status)
+    await update.message.reply_text(status)
 
-def check_command(update: Update, context: CallbackContext):
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /check"""
-    update.message.reply_text("🔄 Запускаю ручную проверку страницы...")
-    result = check_news_and_notify()
-    update.message.reply_text(result)
+    await update.message.reply_text("🔄 Запускаю ручную проверку страницы...")
+    result = await check_news_and_notify()
+    await update.message.reply_text(result)
 
 # Регистрация обработчиков команд
-dispatcher.add_handler(CommandHandler("start", start_command))
-dispatcher.add_handler(CommandHandler("status", status_command))
-dispatcher.add_handler(CommandHandler("check", check_command))
+telegram_app.add_handler(CommandHandler("start", start_command))
+telegram_app.add_handler(CommandHandler("status", status_command))
+telegram_app.add_handler(CommandHandler("check", check_command))
 
 # --- WEB SERVER ---
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
-def webhook():
+async def webhook():
     """Endpoint для обработки обновлений Telegram"""
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "OK"
+    await telegram_app.update_queue.put(
+        Update.de_json(data=request.get_json(), bot=telegram_app.bot)
+    )
+    return {"status": "ok"}, 200
 
 @app.route("/health", methods=["GET"])
 def health_check():
@@ -303,7 +305,7 @@ def health_check():
         "interval_minutes": CHECK_INTERVAL_MINUTES
     }), 200
 
-def setup_webhook():
+async def setup_webhook():
     """Настройка вебхука Telegram"""
     if not WEBHOOK_URL:
         logger.warning("WEBHOOK_URL не задан. Пропускаю настройку вебхука")
@@ -311,7 +313,7 @@ def setup_webhook():
         
     webhook_path = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
     try:
-        bot.set_webhook(url=webhook_path)
+        await telegram_app.bot.set_webhook(url=webhook_path)
         logger.info(f"Вебхук установлен: {webhook_path}")
     except Exception as e:
         logger.error(f"Ошибка настройки вебхука: {str(e)}")
@@ -328,8 +330,8 @@ def background_page_checker():
     while True:
         try:
             start_time = time.time()
-            result = check_news_and_notify()
-            logger.info(result)
+            # Запуск асинхронной функции
+            telegram_app.create_task(check_news_and_notify())
             
             # Расчет времени до следующей проверки
             elapsed = time.time() - start_time
@@ -341,15 +343,28 @@ def background_page_checker():
             logger.error(f"Критическая ошибка в фоновом потоке: {str(e)}")
             time.sleep(300)  # Пауза 5 минут при ошибке
 
-if __name__ == "__main__":
+async def start_bot():
+    """Запуск Telegram бота"""
     # Настройка вебхука
-    setup_webhook()
+    await setup_webhook()
     
     # Запуск фонового потока
-    monitor_thread = Thread(target=background_page_checker, daemon=True)
-    monitor_thread.start()
+    thread = Thread(target=background_page_checker, daemon=True)
+    thread.start()
     
+    # Запуск обработки обновлений
+    await telegram_app.initialize()
+    await telegram_app.start()
+    logger.info("Telegram бот запущен")
+
+if __name__ == "__main__":
     # Запуск веб-сервера
     port = int(get_env_var("PORT", "8000"))
-    logger.info(f"Сервер запущен на порту {port}")
+    
+    # Запуск бота в асинхронном режиме
+    import asyncio
+    loop = asyncio.get_event_loop()
+    
+    # Создаем и запускаем задачи
+    loop.create_task(start_bot())
     app.run(host="0.0.0.0", port=port, use_reloader=False)
