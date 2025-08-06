@@ -11,7 +11,6 @@ from telegram.ext import Dispatcher, CommandHandler, CallbackContext
 from bs4 import BeautifulSoup
 from PIL import Image
 import io
-import base64
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(
@@ -53,14 +52,12 @@ def fetch_page_content():
     params = {
         'api_key': SCRAPINGBEE_API_KEY,
         'url': NEWS_URL,
-        'render_js': 'true',  # Рендеринг JavaScript
-        'wait': 5000,         # Ожидание 5 секунд
-        'wait_for': '.content',  # Ожидание загрузки контента
-        'block_resources': 'false',  # Загрузка всех ресурсов
-        'custom_google': 'true',     # Оптимизация для сложных сайтов
-        'premium_proxy': 'true',     # Использование премиум-прокси
-        'country_code': 'us',        # Геолокация прокси
-        'transparent_status_code': 'true'  # Возврат реального статуса
+        'render_js': 'true',
+        'wait': 5000,
+        'wait_for': '.content',
+        'premium_proxy': 'true',
+        'country_code': 'us',
+        'transparent_status_code': 'true'
     }
     
     try:
@@ -70,7 +67,6 @@ def fetch_page_content():
             timeout=60
         )
         
-        # Проверка статуса
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
             
@@ -107,16 +103,16 @@ def fetch_page_content():
         return None
 
 def capture_screenshot():
-    """Делает скриншот страницы через ScrapingBee"""
+    """Делает скриншот страницы через ScrapingBee (требует Pro-аккаунт)"""
     params = {
         'api_key': SCRAPINGBEE_API_KEY,
         'url': NEWS_URL,
-        'screenshot': 'true',          # Запрос скриншота
-        'screenshot_full_page': 'true', # Полностраничный скриншот
-        'wait': 3000,                   # Ожидание 3 секунды
-        'window_width': 1200,           # Ширина окна
-        'premium_proxy': 'true',        # Премиум прокси
-        'block_ads': 'true'             # Блокировка рекламы
+        'screenshot': 'true',
+        'screenshot_full_page': 'true',
+        'wait': 3000,
+        'window_width': 1200,
+        'premium_proxy': 'true',
+        'block_ads': 'true'
     }
     
     try:
@@ -127,7 +123,6 @@ def capture_screenshot():
         )
         
         if response.status_code == 200:
-            # Оптимизация размера
             img = Image.open(io.BytesIO(response.content))
             img = img.convert('RGB')
             output = io.BytesIO()
@@ -191,7 +186,7 @@ def load_state():
                 last_error_time = state.get('last_error_time', 0)
                 logger.info("Состояние успешно загружено")
     except Exception as e:
-        logger.error(f"Ошибка загрузки состояния: {str(e)}")
+        logger.error(f"Ошибка загрузения состояния: {str(e)}")
 
 # --- ОСНОВНАЯ ЛОГИКА ---
 def check_news_and_notify():
@@ -211,13 +206,10 @@ def check_news_and_notify():
                 
                 if current_time - last_error_time > ERROR_NOTIFICATION_INTERVAL:
                     last_error_time = current_time
-                    screenshot = capture_screenshot()
                     send_telegram_message(
                         f"⚠️ Ошибка получения страницы VFS!\n\n"
                         f"Ссылка: {NEWS_URL}\n"
-                        f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                        f"Отправляю скриншот последнего состояния страницы.",
-                        screenshot
+                        f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
                 return "❌ Ошибка получения страницы"
             
@@ -226,13 +218,11 @@ def check_news_and_notify():
             # Первый запуск
             if last_news_hash is None:
                 last_news_hash = current_hash
-                screenshot = capture_screenshot()
                 send_telegram_message(
                     f"✅ Бот запущен и начал мониторинг страницы VFS!\n\n"
                     f"Ссылка: {NEWS_URL}\n"
                     f"Интервал проверки: {CHECK_INTERVAL_MINUTES} минут\n\n"
-                    f"Текущее содержимое страницы:\n\n{page_content}",
-                    screenshot
+                    f"Текущее содержимое страницы:\n\n{page_content}"
                 )
                 save_state()
                 return "✅ Первоначальное содержимое загружено"
@@ -240,13 +230,11 @@ def check_news_and_notify():
             # Обнаружены изменения
             if current_hash != last_news_hash:
                 last_news_hash = current_hash
-                screenshot = capture_screenshot()
                 send_telegram_message(
                     f"🆕 ОБНОВЛЕНИЕ НА СТРАНИЦЕ VFS!\n\n"
                     f"Ссылка: {NEWS_URL}\n"
                     f"Время обнаружения: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                    f"Новое содержимое:\n\n{page_content}",
-                    screenshot
+                    f"Новое содержимое:\n\n{page_content}"
                 )
                 save_state()
                 return "✅ Обновление обнаружено и отправлено"
