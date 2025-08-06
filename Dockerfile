@@ -1,6 +1,9 @@
 # Используем официальный образ Python
 FROM python:3.11-slim
 
+# Установка последней версии setuptools
+RUN pip install --no-cache-dir --upgrade setuptools
+
 # Устанавливаем системные зависимости
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
