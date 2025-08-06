@@ -2,5 +2,4 @@ Flask==3.0.3
 requests==2.31.0
 beautifulsoup4==4.12.3
 python-telegram-bot==21.1
-gunicorn==21.2.0
 scrapingbee==2.0.1

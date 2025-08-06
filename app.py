@@ -6,6 +6,7 @@ import hashlib
 import json
 import requests
 import asyncio
+import threading
 from flask import Flask, request, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -20,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("VFSMonitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-logger.info("🚀 Starting VFS Monitor Bot...")
+logger.info("🚀 Starting VFS Monitor Bot on PythonAnywhere...")
 
 # Проверка критических переменных среды
 def get_env_var(name, default=None):
@@ -43,8 +44,6 @@ ERROR_NOTIFICATION_INTERVAL = 6 * 3600  # 6 часов между уведомл
 app = Flask(__name__)
 last_news_hash = None
 last_error_time = 0
-
-# Telegram Application будет инициализировано позже
 telegram_app = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -253,8 +252,7 @@ def home():
         "version": "1.0",
         "endpoints": {
             "health": "/health",
-            "webhook": "/webhook",
-            "env_check": "/env"
+            "webhook": "/webhook"
         }
     })
 
@@ -267,26 +265,15 @@ def health_check():
         "interval_minutes": CHECK_INTERVAL_MINUTES
     })
 
-@app.route("/env")
-def env_check():
-    return jsonify({
-        "RENDER_SERVICE_NAME": os.environ.get("RENDER_SERVICE_NAME"),
-        "TELEGRAM_TOKEN": "present" if os.environ.get("TELEGRAM_TOKEN") else "missing",
-        "PORT": os.environ.get("PORT"),
-        "PYTHON_VERSION": sys.version
-    })
-
 async def setup_webhook():
     """Настройка вебхука Telegram"""
     try:
-        service_name = os.environ.get('RENDER_SERVICE_NAME')
-        if not service_name:
-            logger.error("RENDER_SERVICE_NAME не установлен в переменных окружения!")
+        username = os.environ.get("PYTHONANYWHERE_USER")
+        if not username:
+            logger.error("PYTHONANYWHERE_USER не установлен!")
             return False
         
-        logger.info(f"Получено имя сервиса: {service_name}")
-        
-        webhook_url = f"https://{service_name}.onrender.com/webhook"
+        webhook_url = f"https://{username}.pythonanywhere.com/webhook"
         logger.info(f"Попытка установки вебхука: {webhook_url}")
         
         result = await telegram_app.bot.set_webhook(url=webhook_url)
@@ -301,6 +288,8 @@ async def webhook():
     """Endpoint для обработки обновлений Telegram"""
     try:
         json_data = request.get_json()
+        logger.info(f"Получено обновление от Telegram: {json_data}")
+        
         update = Update.de_json(json_data, telegram_app.bot)
         await telegram_app.process_update(update)
         return {"status": "ok"}, 200
@@ -355,20 +344,20 @@ async def start_bot():
     except Exception as e:
         logger.exception(f"Критическая ошибка при запуске бота: {str(e)}")
 
-def run_flask():
-    """Запуск Flask сервера"""
-    port = int(os.environ.get('PORT', '10000'))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(start_bot())
 
-async def main():
-    """Главная функция инициализации"""
-    # Запускаем бота в фоне
-    asyncio.create_task(start_bot())
-    
-    # Запускаем Flask в главном потоке
-    run_flask()
+# Запуск бота в фоновом потоке при старте приложения
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
+
+# Для WSGI на PythonAnywhere
+application = app
 
 if __name__ == "__main__":
-    logger.info("Запуск приложения...")
-    # Для Render используем asyncio
-    asyncio.run(main())
+    # Для локального тестирования
+    port = int(os.environ.get('PORT', '5000'))
+    app.run(host="0.0.0.0", port=port)
