@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import os
 import logging
 import time
@@ -52,9 +54,7 @@ scraper = cloudscraper.create_scraper(
         'browser': 'chrome',
         'platform': 'windows',
         'desktop': True
-    },
-    delay=10,
-    retries=5
+    }
 )
 
 # --- ОСНОВНЫЕ ФУНКЦИИ ---
@@ -98,6 +98,7 @@ def fetch_news():
         
         for script in script_data:
             try:
+                # Обрабатываем как JSON, если возможно
                 data = json.loads(script.string)
                 if isinstance(data, dict) and data.get("@type") == "NewsArticle":
                     logging.info("Найден скрипт с данными новости (JSON-LD)")
@@ -107,19 +108,21 @@ def fetch_news():
                         news_text = f"{headline}\n\n{body}" if headline and body else headline or body
                         break
             except:
-                # Попробуем найти данные в тексте скрипта
-                script_text = script.string or ""
-                if '"@type":"NewsArticle"' in script_text:
-                    logging.info("Найден скрипт с данными новости (текстовый поиск)")
-                    # Пытаемся извлечь данные с помощью регулярных выражений
-                    headline_match = re.search(r'"headline":\s*"([^"]+)"', script_text)
-                    body_match = re.search(r'"articleBody":\s*"([^"]+)"', script_text)
-                    
-                    if headline_match or body_match:
-                        headline = headline_match.group(1) if headline_match else ""
-                        body = body_match.group(1) if body_match else ""
-                        news_text = f"{headline}\n\n{body}" if headline and body else headline or body
-                        break
+                try:
+                    # Попробуем извлечь данные с помощью регулярных выражений
+                    script_text = script.string or ""
+                    if '"@type":"NewsArticle"' in script_text:
+                        logging.info("Найден скрипт с данными новости (текстовый поиск)")
+                        headline_match = re.search(r'"headline":\s*"([^"]+)"', script_text)
+                        body_match = re.search(r'"articleBody":\s*"([^"]+)"', script_text)
+                        
+                        if headline_match or body_match:
+                            headline = headline_match.group(1) if headline_match else ""
+                            body = body_match.group(1) if body_match else ""
+                            news_text = f"{headline}\n\n{body}" if headline and body else headline or body
+                            break
+                except Exception as e:
+                    logging.warning(f"Ошибка при парсинге скрипта: {str(e)}")
 
         # Если не нашли в скриптах, попробуем основной контент
         if not news_text:
