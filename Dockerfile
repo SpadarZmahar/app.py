@@ -14,9 +14,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Копируем исходный код
 COPY . .
 
-# Устанавливаем переменные среды по умолчанию
+# Устанавливаем порт по умолчанию
 ENV PORT=8000
-ENV CHECK_INTERVAL_MINUTES=60
 
 # Запускаем приложение
 CMD ["python", "app.py"]
