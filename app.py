@@ -48,7 +48,7 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 last_news_hash = None
 
-# Инициализация CloudScraper с увеличенным количеством попыток
+# Инициализация CloudScraper
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
@@ -75,18 +75,13 @@ def fetch_news():
             'Sec-Fetch-Dest': 'document'
         }
         
-        # Увеличиваем таймаут и добавляем параметры для обхода Cloudflare
-        response = scraper.get(
-            NEWS_URL,
-            headers=headers,
-            timeout=60
-        )
+        response = scraper.get(NEWS_URL, headers=headers, timeout=60)
         response.raise_for_status()
 
         # Проверяем, не получили ли мы страницу проверки Cloudflare
         if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
             logging.warning("Обнаружена страница проверки Cloudflare. Увеличиваем задержку...")
-            time.sleep(15)  # Увеличиваем задержку перед повторной попыткой
+            time.sleep(15)
             response = scraper.get(NEWS_URL, headers=headers, timeout=60)
             response.raise_for_status()
 
@@ -98,7 +93,7 @@ def fetch_news():
         
         for script in script_data:
             try:
-                # Обрабатываем как JSON, если возможно
+                # Обрабатываем как JSON
                 data = json.loads(script.string)
                 if isinstance(data, dict) and data.get("@type") == "NewsArticle":
                     logging.info("Найден скрипт с данными новости (JSON-LD)")
@@ -108,44 +103,64 @@ def fetch_news():
                         news_text = f"{headline}\n\n{body}" if headline and body else headline or body
                         break
             except:
-                try:
-                    # Попробуем извлечь данные с помощью регулярных выражений
-                    script_text = script.string or ""
-                    if '"@type":"NewsArticle"' in script_text:
-                        logging.info("Найден скрипт с данными новости (текстовый поиск)")
-                        headline_match = re.search(r'"headline":\s*"([^"]+)"', script_text)
-                        body_match = re.search(r'"articleBody":\s*"([^"]+)"', script_text)
-                        
-                        if headline_match or body_match:
-                            headline = headline_match.group(1) if headline_match else ""
-                            body = body_match.group(1) if body_match else ""
-                            news_text = f"{headline}\n\n{body}" if headline and body else headline or body
-                            break
-                except Exception as e:
-                    logging.warning(f"Ошибка при парсинге скрипта: {str(e)}")
+                # Пробуем извлечь данные с помощью регулярных выражений
+                script_text = script.string or ""
+                if '"@type":"NewsArticle"' in script_text:
+                    logging.info("Найден скрипт с данными новости (текстовый поиск)")
+                    headline_match = re.search(r'"headline":\s*"([^"]+)"', script_text)
+                    body_match = re.search(r'"articleBody":\s*"([^"]+)"', script_text)
+                    
+                    if headline_match or body_match:
+                        headline = headline_match.group(1) if headline_match else ""
+                        body = body_match.group(1) if body_match else ""
+                        news_text = f"{headline}\n\n{body}" if headline and body else headline or body
+                        break
 
         # Если не нашли в скриптах, попробуем основной контент
         if not news_text:
-            main_content = soup.find('main') or soup.find('div', role='main') or soup.find('div', id='__nuxt')
-            if main_content:
-                logging.info("Найден основной контент страницы")
-                news_text = main_content.get_text(separator="\n", strip=True)
-                news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
+            # Основные контейнеры для контента
+            content_selectors = [
+                'div.vfsg-news-content',  # Старый селектор
+                'div.news-content',       # Общий класс
+                'div.announcement',       # Другой возможный класс
+                'div.content-main',       # Основной контент
+                'div.page-content',       # Контент страницы
+                'main',                   # Тег main
+                'div[role="main"]',       # Контейнер с role="main"
+                'div#__nuxt'              # Nuxt.js контейнер
+            ]
+            
+            for selector in content_selectors:
+                content = soup.select_one(selector)
+                if content:
+                    logging.info(f"Найден контент с селектором: {selector}")
+                    news_text = content.get_text(separator="\n", strip=True)
+                    break
         
         if not news_text:
             logging.error("Не удалось найти новостной блок на странице")
             return None
         
-        # Очищаем текст от лишних элементов
-        unwanted_phrases = [
-            "cookie policy", "политика использования файлов cookie", "© copyright",
-            "Loading...", "nuxt-loading", "vfsglobal", "javascript"
-        ]
-        for phrase in unwanted_phrases:
-            news_text = news_text.replace(phrase, "")
+        # Очищаем текст только если он слишком длинный
+        if len(news_text) > 500:
+            # Удаляем технические фразы
+            unwanted_phrases = [
+                "cookie policy", "политика использования файлов cookie", "© copyright",
+                "Loading...", "nuxt-loading", "javascript", "vfsglobal", "cloudflare"
+            ]
+            for phrase in unwanted_phrases:
+                news_text = news_text.replace(phrase, "")
             
-        # Удаляем лишние пробелы и пустые строки
-        news_text = re.sub(r'\s+', ' ', news_text).strip()
+            # Удаляем лишние пробелы
+            news_text = re.sub(r'\s+', ' ', news_text).strip()
+        
+        # Удаляем пустые строки и нормализуем текст
+        news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
+        
+        # Если текст слишком короткий, вероятно, мы получили не то
+        if len(news_text) < 50:
+            logging.warning(f"Текст новости слишком короткий: {len(news_text)} символов")
+            return None
         
         return news_text
 
