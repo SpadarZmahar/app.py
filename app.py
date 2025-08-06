@@ -77,17 +77,29 @@ def fetch_page_content():
         response = scraper.get(NEWS_URL, headers=headers, timeout=60)
         response.raise_for_status()
 
+        # Если страница перенаправляет, используем конечный URL
+        final_url = response.url
+        if final_url != NEWS_URL:
+            logging.info(f"Перенаправление на: {final_url}")
+            response = scraper.get(final_url, headers=headers, timeout=60)
+            response.raise_for_status()
+
         # Проверяем, не получили ли мы страницу проверки Cloudflare
         if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
-            logging.warning("Обнаружена страница проверки Cloudflare. Увеличиваем задержку...")
-            time.sleep(15)
+            logging.warning("Обнаружена страница проверки Cloudflare. Используем альтернативный метод...")
+            # Пробуем получить данные через 30 секунд
+            time.sleep(30)
             response = scraper.get(NEWS_URL, headers=headers, timeout=60)
             response.raise_for_status()
 
         # Извлекаем основной контент страницы
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Получаем весь текст страницы
+        # Удаляем ненужные элементы (скрипты, стили и т.д.)
+        for element in soup(["script", "style", "meta", "link", "nav", "footer"]):
+            element.decompose()
+        
+        # Получаем текст страницы
         page_text = soup.get_text(separator="\n", strip=True)
         
         # Удаляем лишние пробелы и пустые строки
@@ -96,7 +108,7 @@ def fetch_page_content():
         # Удаляем технические фразы
         unwanted_phrases = [
             "cookie policy", "политика использования файлов cookie", "© copyright",
-            "Loading...", "nuxt-loading", "javascript", "vfsglobal", "cloudflare"
+            "Loading...", "javascript", "vfsglobal", "cloudflare", "rocket-loader"
         ]
         for phrase in unwanted_phrases:
             page_text = page_text.replace(phrase, "")
@@ -131,18 +143,19 @@ def check_news_and_notify():
     page_content = fetch_page_content()
     if not page_content:
         logging.warning("Не удалось получить содержимое страницы")
+        send_telegram_message("⚠️ Не удалось получить содержимое страницы VFS")
         return "❌ Ошибка получения страницы"
 
     current_hash = calculate_hash(page_content)
     
     if last_news_hash is None:
         last_news_hash = current_hash
-        send_telegram_message(f"✅ Бот запущен. Текущее содержимое страницы:\n\n{page_content}")
+        send_telegram_message(f"✅ Бот запущен! Буду присылать уведомления об изменениях на странице:\n{NEWS_URL}\n\nТекущее содержимое:\n\n{page_content}")
         return "✅ Первоначальное содержимое загружено"
     
     if current_hash != last_news_hash:
         last_news_hash = current_hash
-        message = f"🆕 ИЗМЕНЕНИЯ НА СТРАНИЦЕ VFS:\n\n{page_content}"
+        message = f"🆕 ОБНОВЛЕНИЕ НА СТРАНИЦЕ VFS!\n\nСсылка: {NEWS_URL}\n\nНовое содержимое:\n\n{page_content}"
         send_telegram_message(message)
         return "✅ Обновление обнаружено и отправлено"
     
@@ -150,10 +163,11 @@ def check_news_and_notify():
 
 # --- ОБРАБОТЧИКИ КОМАНД TELEGRAM ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text("✅ Бот активен! Автоматически проверяю страницу VFS каждые 5 минут.")
+    update.message.reply_text(f"✅ Бот активен! Автоматически проверяю страницу VFS каждые {CHECK_INTERVAL_SECONDS//60} минут.\nСсылка: {NEWS_URL}")
 
 def status_command(update: Update, context: CallbackContext):
     status = "🟢 Бот работает\n"
+    status += f"Проверяемая страница: {NEWS_URL}\n"
     status += f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
     if WEBHOOK_URL:
         status += "✅ Вебхук настроен"
@@ -162,7 +176,7 @@ def status_command(update: Update, context: CallbackContext):
     update.message.reply_text(status)
 
 def check_command(update: Update, context: CallbackContext):
-    update.message.reply_text("🔄 Ручная проверка...")
+    update.message.reply_text("🔄 Запускаю ручную проверку страницы...")
     result = check_news_and_notify()
     update.message.reply_text(result)
 
