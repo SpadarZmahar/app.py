@@ -1,181 +1,368 @@
 # -*- coding: utf-8 -*-
-
 import os
 import logging
 import time
 import hashlib
-from threading import Thread
+from threading import Thread, Lock
 import cloudscraper
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from PIL import Image
+import io
+import json
+import requests
 
 # --- НАСТРОЙКИ ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - [%(levelname)s] - %(message)s",
 )
+logger = logging.getLogger("VFSMonitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("cloudscraper").setLevel(logging.WARNING)
+logging.getLogger("selenium").setLevel(logging.WARNING)
 
 # Проверка критических переменных среды
-def get_env_var(name):
-    value = os.environ.get(name)
-    if not value:
-        logging.critical(f"Переменная окружения {name} не установлена!")
+def get_env_var(name, default=None):
+    value = os.environ.get(name, default)
+    if not value and default is None:
+        logger.critical(f"Переменная окружения {name} не установлена!")
         raise ValueError(f"{name} не задана")
     return value
 
+# Конфигурация
 TELEGRAM_TOKEN = get_env_var("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = get_env_var("TELEGRAM_CHAT_ID")
-
-# WEBHOOK_URL теперь опциональная переменная
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-if not WEBHOOK_URL:
-    logging.warning("WEBHOOK_URL не задан. Вебхук не будет настроен автоматически")
-
-# Конфигурация
 NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
-CHECK_INTERVAL_SECONDS = 60 * 60  # 1 час (60 минут)
+WEBHOOK_URL = get_env_var("WEBHOOK_URL", "")
+CHECK_INTERVAL_MINUTES = int(get_env_var("CHECK_INTERVAL_MINUTES", "60"))  # По умолчанию 60 минут
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-MAX_TEXT_LENGTH = 4000  # Максимальная длина текста для Telegram (4096 с запасом)
+MAX_TEXT_LENGTH = 4000
+MAX_SCREENSHOT_ATTEMPTS = 2
+ERROR_NOTIFICATION_INTERVAL = 6 * 3600  # 6 часов между уведомлениями об ошибках
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 app = Flask(__name__)
 bot = Bot(token=TELEGRAM_TOKEN)
 dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 last_news_hash = None
+last_error_time = 0
+state_lock = Lock()
 
 # Инициализация CloudScraper
 scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
+    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
 )
 
-# --- ОСНОВНЫЕ ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def init_selenium_driver():
+    """Инициализирует headless Chrome для Selenium"""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,720")
+    options.add_argument(f"user-agent={USER_AGENT}")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    
+    # Для Railway
+    options.binary_location = "/usr/bin/google-chrome-stable"
+    
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+    )
+    return driver
+
 def fetch_page_content():
-    """Получает содержимое страницы целиком"""
+    """Получает содержимое страницы с обходом Cloudflare"""
+    max_attempts = 3
+    attempt = 0
+    delay = 15
+    
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            logger.info(f"Попытка {attempt}/{max_attempts} получения страницы")
+            
+            headers = {
+                'User-Agent': USER_AGENT,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+                'DNT': '1',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-User': '?1',
+                'Sec-Fetch-Dest': 'document'
+            }
+            
+            response = scraper.get(NEWS_URL, headers=headers, timeout=30)
+            response.raise_for_status()
+
+            # Проверка на Cloudflare
+            if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
+                logger.warning(f"Обнаружена страница проверки Cloudflare. Ожидание {delay} сек...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            # Удаляем ненужные элементы
+            for element in soup(["script", "style", "meta", "link", "nav", "footer", "header"]):
+                element.decompose()
+            
+            # Извлекаем основной контент
+            content_div = soup.find('div', class_='content')
+            page_text = content_div.get_text(separator="\n", strip=True) if content_div else soup.get_text()
+            
+            # Очистка текста
+            page_text = "\n".join(line.strip() for line in page_text.split("\n") if line.strip())
+            
+            # Удаляем технические фразы
+            unwanted_phrases = [
+                "cookie policy", "политика использования файлов cookie", "© copyright",
+                "Loading...", "javascript", "vfsglobal", "cloudflare", "rocket-loader",
+                "challenge", "verification", "ddos", "protection", "DDoS"
+            ]
+            for phrase in unwanted_phrases:
+                page_text = page_text.replace(phrase, "")
+            
+            if len(page_text) > MAX_TEXT_LENGTH:
+                page_text = page_text[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)"
+            
+            return page_text
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении страницы (попытка {attempt}): {str(e)}")
+            time.sleep(delay)
+            delay *= 2
+    
+    logger.warning("Не удалось получить содержимое через requests. Пробуем Selenium...")
+    return fetch_with_selenium()
+
+def fetch_with_selenium():
+    """Использует Selenium для получения контента"""
+    driver = None
     try:
-        headers = {
-            'User-Agent': USER_AGENT,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'DNT': '1',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-User': '?1',
-            'Sec-Fetch-Dest': 'document'
-        }
+        driver = init_selenium_driver()
+        driver.get(NEWS_URL)
+        time.sleep(5)
         
-        response = scraper.get(NEWS_URL, headers=headers, timeout=60)
-        response.raise_for_status()
-
-        # Если страница перенаправляет, используем конечный URL
-        final_url = response.url
-        if final_url != NEWS_URL:
-            logging.info(f"Перенаправление на: {final_url}")
-            response = scraper.get(final_url, headers=headers, timeout=60)
-            response.raise_for_status()
-
-        # Проверяем, не получили ли мы страницу проверки Cloudflare
-        if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
-            logging.warning("Обнаружена страница проверки Cloudflare. Используем альтернативный метод...")
-            # Пробуем получить данные через 30 секунд
-            time.sleep(30)
-            response = scraper.get(NEWS_URL, headers=headers, timeout=60)
-            response.raise_for_status()
-
-        # Извлекаем основной контент страницы
-        soup = BeautifulSoup(response.text, "html.parser")
+        # Проверка на Cloudflare
+        if "cf-browser-verification" in driver.page_source:
+            logger.warning("Cloudflare обнаружен в Selenium. Ожидание 15 секунд...")
+            time.sleep(15)
+            driver.refresh()
+            time.sleep(10)
         
-        # Удаляем ненужные элементы (скрипты, стили и т.д.)
-        for element in soup(["script", "style", "meta", "link", "nav", "footer"]):
-            element.decompose()
-        
-        # Получаем текст страницы
-        page_text = soup.get_text(separator="\n", strip=True)
-        
-        # Удаляем лишние пробелы и пустые строки
-        page_text = "\n".join(line.strip() for line in page_text.split("\n") if line.strip())
-        
-        # Удаляем технические фразы
-        unwanted_phrases = [
-            "cookie policy", "политика использования файлов cookie", "© copyright",
-            "Loading...", "javascript", "vfsglobal", "cloudflare", "rocket-loader"
-        ]
-        for phrase in unwanted_phrases:
-            page_text = page_text.replace(phrase, "")
-        
-        # Сокращаем слишком длинный текст
-        if len(page_text) > MAX_TEXT_LENGTH:
-            page_text = page_text[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)"
-        
-        return page_text
-
+        # Получение основного контента
+        content = driver.find_element("tag name", "body").text
+        return content[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)" if len(content) > MAX_TEXT_LENGTH else content
+    
     except Exception as e:
-        logging.error(f"Ошибка при получении страницы: {str(e)}")
+        logger.error(f"Ошибка при получении страницы через Selenium: {str(e)}")
         return None
+    
+    finally:
+        if driver:
+            driver.quit()
 
-def send_telegram_message(message):
-    """Отправляет сообщение в Telegram чат"""
+def capture_screenshot():
+    """Делает скриншот страницы и возвращает как bytes"""
+    driver = None
+    attempt = 0
+    
+    while attempt < MAX_SCREENSHOT_ATTEMPTS:
+        attempt += 1
+        try:
+            driver = init_selenium_driver()
+            driver.get(NEWS_URL)
+            time.sleep(3)
+            
+            # Создание скриншота
+            screenshot = driver.get_screenshot_as_png()
+            
+            # Оптимизация размера
+            img = Image.open(io.BytesIO(screenshot))
+            img = img.convert('RGB')
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=80)
+            return output.getvalue()
+        
+        except Exception as e:
+            logger.error(f"Ошибка при создании скриншота (попытка {attempt}): {str(e)}")
+            time.sleep(5)
+        
+        finally:
+            if driver:
+                driver.quit()
+    
+    return None
+
+def send_telegram_message(message, image_bytes=None):
+    """Отправляет сообщение и/или изображение в Telegram"""
     try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-        logging.info(f"Сообщение отправлено: {message[:50]}...")
+        if image_bytes:
+            # Для длинных сообщений делаем обрезанный caption
+            caption = message if len(message) <= 1000 else message[:900] + "\n\n... (сообщение сокращено)"
+            bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=image_bytes,
+                caption=caption
+            )
+            logger.info("Скриншот отправлен в Telegram")
+        else:
+            # Разбиваем длинные сообщения на части
+            if len(message) > 4000:
+                parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
+                for part in parts:
+                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=part)
+                    time.sleep(1)
+            else:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            logger.info(f"Сообщение отправлено")
     except Exception as e:
-        logging.error(f"Ошибка отправки в Telegram: {str(e)}")
+        logger.error(f"Ошибка отправки в Telegram: {str(e)}")
 
 def calculate_hash(content):
-    """Вычисляет стабильный хеш контента"""
+    """Вычисляет MD5 хеш контента"""
     return hashlib.md5(content.encode('utf-8')).hexdigest() if content else ""
 
+def save_state():
+    """Сохраняет состояние в файл (для сохранения при перезапусках)"""
+    state = {
+        'last_news_hash': last_news_hash,
+        'last_error_time': last_error_time
+    }
+    try:
+        with open('state.json', 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения состояния: {str(e)}")
+
+def load_state():
+    """Загружает состояние из файла"""
+    global last_news_hash, last_error_time
+    try:
+        if os.path.exists('state.json'):
+            with open('state.json', 'r') as f:
+                state = json.load(f)
+                last_news_hash = state.get('last_news_hash')
+                last_error_time = state.get('last_error_time', 0)
+                logger.info("Состояние успешно загружено")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки состояния: {str(e)}")
+
+# --- ОСНОВНАЯ ЛОГИКА ---
 def check_news_and_notify():
     """Проверяет страницу и отправляет уведомления при изменениях"""
-    global last_news_hash
-    logging.info("Запущена проверка страницы")
-
-    page_content = fetch_page_content()
-    if not page_content:
-        logging.warning("Не удалось получить содержимое страницы")
-        send_telegram_message("⚠️ Не удалось получить содержимое страницы VFS")
-        return "❌ Ошибка получения страницы"
-
-    current_hash = calculate_hash(page_content)
+    global last_news_hash, last_error_time
     
-    if last_news_hash is None:
-        last_news_hash = current_hash
-        send_telegram_message(f"✅ Бот запущен! Буду присылать уведомления об изменениях на странице:\n{NEWS_URL}\n\nТекущее содержимое:\n\n{page_content}")
-        return "✅ Первоначальное содержимое загружено"
-    
-    if current_hash != last_news_hash:
-        last_news_hash = current_hash
-        message = f"🆕 ОБНОВЛЕНИЕ НА СТРАНИЦЕ VFS!\n\nСсылка: {NEWS_URL}\n\nНовое содержимое:\n\n{page_content}"
-        send_telegram_message(message)
-        return "✅ Обновление обнаружено и отправлено"
-    
-    return "ℹ️ Изменений нет"
+    with state_lock:
+        logger.info("Запущена проверка страницы")
+        page_content = None
+        
+        try:
+            page_content = fetch_page_content()
+            
+            if not page_content:
+                logger.warning("Не удалось получить содержимое страницы")
+                current_time = time.time()
+                
+                # Отправляем уведомление об ошибке не чаще чем раз в ERROR_NOTIFICATION_INTERVAL
+                if current_time - last_error_time > ERROR_NOTIFICATION_INTERVAL:
+                    last_error_time = current_time
+                    screenshot = capture_screenshot()
+                    send_telegram_message(
+                        f"⚠️ Ошибка получения страницы VFS!\n\n"
+                        f"Ссылка: {NEWS_URL}\n"
+                        f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                        f"Отправляю скриншот последнего состояния страницы.",
+                        screenshot
+                    )
+                return "❌ Ошибка получения страницы"
+            
+            current_hash = calculate_hash(page_content)
+            
+            # Первый запуск
+            if last_news_hash is None:
+                last_news_hash = current_hash
+                screenshot = capture_screenshot()
+                send_telegram_message(
+                    f"✅ Бот запущен и начал мониторинг страницы VFS!\n\n"
+                    f"Ссылка: {NEWS_URL}\n"
+                    f"Интервал проверки: {CHECK_INTERVAL_MINUTES} минут\n\n"
+                    f"Текущее содержимое страницы:\n\n{page_content}",
+                    screenshot
+                )
+                save_state()
+                return "✅ Первоначальное содержимое загружено"
+            
+            # Обнаружены изменения
+            if current_hash != last_news_hash:
+                last_news_hash = current_hash
+                screenshot = capture_screenshot()
+                send_telegram_message(
+                    f"🆕 ОБНОВЛЕНИЕ НА СТРАНИЦЕ VFS!\n\n"
+                    f"Ссылка: {NEWS_URL}\n"
+                    f"Время обнаружения: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"Новое содержимое:\n\n{page_content}",
+                    screenshot
+                )
+                save_state()
+                return "✅ Обновление обнаружено и отправлено"
+            
+            return "ℹ️ Изменений нет"
+        
+        except Exception as e:
+            logger.error(f"Критическая ошибка в check_news_and_notify: {str(e)}")
+            return f"❌ Критическая ошибка: {str(e)}"
 
-# --- ОБРАБОТЧИКИ КОМАНД TELEGRAM ---
+# --- ОБРАБОТЧИКИ TELEGRAM ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text(f"✅ Бот активен! Автоматически проверяю страницу VFS каждые {CHECK_INTERVAL_SECONDS//60} минут.\nСсылка: {NEWS_URL}")
+    """Обработчик команды /start"""
+    update.message.reply_text(
+        f"✅ Бот активен! Автоматически проверяю страницу VFS каждые {CHECK_INTERVAL_MINUTES} минут.\n"
+        f"Ссылка: {NEWS_URL}\n\n"
+        "Доступные команды:\n"
+        "/status - текущий статус бота\n"
+        "/check - запустить проверку вручную"
+    )
 
 def status_command(update: Update, context: CallbackContext):
+    """Обработчик команды /status"""
     status = "🟢 Бот работает\n"
     status += f"Проверяемая страница: {NEWS_URL}\n"
+    status += f"Интервал проверки: {CHECK_INTERVAL_MINUTES} минут\n"
     status += f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    
     if WEBHOOK_URL:
-        status += "✅ Вебхук настроен"
+        status += "✅ Вебхук настроен\n"
     else:
-        status += "⚠️ Вебхук не настроен"
+        status += "⚠️ Вебхук не настроен\n"
+    
+    if last_news_hash:
+        status += "✅ Мониторинг активен"
+    else:
+        status += "🔄 Ожидание первой проверки"
+    
     update.message.reply_text(status)
 
 def check_command(update: Update, context: CallbackContext):
+    """Обработчик команды /check"""
     update.message.reply_text("🔄 Запускаю ручную проверку страницы...")
     result = check_news_and_notify()
     update.message.reply_text(result)
@@ -185,6 +372,7 @@ dispatcher.add_handler(CommandHandler("start", start_command))
 dispatcher.add_handler(CommandHandler("status", status_command))
 dispatcher.add_handler(CommandHandler("check", check_command))
 
+# --- WEB SERVER ---
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     """Endpoint для обработки обновлений Telegram"""
@@ -195,33 +383,49 @@ def webhook():
 @app.route("/health", methods=["GET"])
 def health_check():
     """Endpoint для проверки работоспособности"""
-    return "OK", 200
+    return json.dumps({
+        "status": "ok",
+        "last_check": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "interval_minutes": CHECK_INTERVAL_MINUTES
+    }), 200
 
 def setup_webhook():
-    """Настройка вебхука Telegram (только если WEBHOOK_URL задан)"""
+    """Настройка вебхука Telegram (если URL задан)"""
     if not WEBHOOK_URL:
-        logging.warning("WEBHOOK_URL не задан. Пропускаю настройку вебхука")
+        logger.warning("WEBHOOK_URL не задан. Пропускаю настройку вебхука")
         return
         
     webhook_path = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
     try:
         bot.set_webhook(url=webhook_path)
-        logging.info(f"Вебхук установлен: {webhook_path}")
+        logger.info(f"Вебхук установлен: {webhook_path}")
     except Exception as e:
-        logging.error(f"Ошибка настройки вебхука: {str(e)}")
+        logger.error(f"Ошибка настройки вебхука: {str(e)}")
 
 def background_page_checker():
     """Фоновая проверка страницы"""
-    time.sleep(10)  # Задержка для инициализации сервера
-    logging.info(f"Фоновый мониторинг запущен. Интервал: {CHECK_INTERVAL_SECONDS} сек")
+    time.sleep(15)  # Задержка для инициализации сервера
+    logger.info(f"Фоновый мониторинг запущен. Интервал: {CHECK_INTERVAL_MINUTES} минут")
     
+    # Загрузка сохраненного состояния
+    load_state()
+    
+    # Основной цикл проверки
     while True:
         try:
-            check_news_and_notify()
-            time.sleep(CHECK_INTERVAL_SECONDS)
+            start_time = time.time()
+            result = check_news_and_notify()
+            logger.info(result)
+            
+            # Расчет времени до следующей проверки
+            elapsed = time.time() - start_time
+            sleep_time = max(CHECK_INTERVAL_MINUTES * 60 - elapsed, 60)
+            logger.info(f"Следующая проверка через {sleep_time/60:.1f} минут")
+            time.sleep(sleep_time)
+            
         except Exception as e:
-            logging.error(f"Ошибка в фоновом задании: {str(e)}")
-            time.sleep(60)
+            logger.error(f"Критическая ошибка в фоновом потоке: {str(e)}")
+            time.sleep(300)  # Пауза 5 минут при ошибке
 
 if __name__ == "__main__":
     # Настройка вебхука (если URL задан)
@@ -232,6 +436,6 @@ if __name__ == "__main__":
     monitor_thread.start()
     
     # Запуск веб-сервера
-    port = int(os.environ.get("PORT", 8080))
-    logging.info(f"Сервер запущен на порту {port}")
-    app.run(host="0.0.0.0", port=port)
+    port = int(get_env_var("PORT", "8000"))
+    logger.info(f"Сервер запущен на порту {port}")
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
