@@ -2,6 +2,8 @@ import os
 import logging
 import time
 import hashlib
+import json
+import re
 from threading import Thread
 import cloudscraper
 from flask import Flask, request
@@ -44,13 +46,15 @@ bot = Bot(token=TELEGRAM_TOKEN)
 dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 last_news_hash = None
 
-# Инициализация CloudScraper
+# Инициализация CloudScraper с увеличенным количеством попыток
 scraper = cloudscraper.create_scraper(
     browser={
         'browser': 'chrome',
         'platform': 'windows',
         'desktop': True
-    }
+    },
+    delay=10,
+    retries=5
 )
 
 # --- ОСНОВНЫЕ ФУНКЦИИ ---
@@ -75,76 +79,75 @@ def fetch_news():
         response = scraper.get(
             NEWS_URL,
             headers=headers,
-            timeout=60,
-            allow_redirects=True
+            timeout=60
         )
         response.raise_for_status()
 
-        # Проверяем, не получили ли мы страницу Cloudflare
+        # Проверяем, не получили ли мы страницу проверки Cloudflare
         if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
-            logging.warning("Обнаружена страница проверки Cloudflare")
-            # Попробуем получить данные через альтернативный метод
-            return fetch_news_alternative()
+            logging.warning("Обнаружена страница проверки Cloudflare. Увеличиваем задержку...")
+            time.sleep(15)  # Увеличиваем задержку перед повторной попыткой
+            response = scraper.get(NEWS_URL, headers=headers, timeout=60)
+            response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
         
         # Попробуем найти JSON-данные в скриптах
         script_data = soup.find_all('script', type='application/ld+json')
+        news_text = None
+        
         for script in script_data:
-            if '"@type":"NewsArticle"' in script.text:
-                logging.info("Найден скрипт с данными новости")
-                # Упрощенный парсинг JSON
-                if '"headline"' in script.text and '"articleBody"' in script.text:
-                    headline_start = script.text.find('"headline":') + 12
-                    headline_end = script.text.find('",', headline_start)
-                    headline = script.text[headline_start:headline_end]
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and data.get("@type") == "NewsArticle":
+                    logging.info("Найден скрипт с данными новости (JSON-LD)")
+                    headline = data.get("headline", "")
+                    body = data.get("articleBody", "")
+                    if headline or body:
+                        news_text = f"{headline}\n\n{body}" if headline and body else headline or body
+                        break
+            except:
+                # Попробуем найти данные в тексте скрипта
+                script_text = script.string or ""
+                if '"@type":"NewsArticle"' in script_text:
+                    logging.info("Найден скрипт с данными новости (текстовый поиск)")
+                    # Пытаемся извлечь данные с помощью регулярных выражений
+                    headline_match = re.search(r'"headline":\s*"([^"]+)"', script_text)
+                    body_match = re.search(r'"articleBody":\s*"([^"]+)"', script_text)
                     
-                    body_start = script.text.find('"articleBody":') + 15
-                    body_end = script.text.find('"', body_start)
-                    body = script.text[body_start:body_end]
-                    
-                    return f"{headline}\n\n{body}"
+                    if headline_match or body_match:
+                        headline = headline_match.group(1) if headline_match else ""
+                        body = body_match.group(1) if body_match else ""
+                        news_text = f"{headline}\n\n{body}" if headline and body else headline or body
+                        break
 
         # Если не нашли в скриптах, попробуем основной контент
-        main_content = soup.find('main') or soup.find('div', role='main')
-        if main_content:
-            logging.info("Найден основной контент страницы")
-            news_text = main_content.get_text(separator="\n", strip=True)
-            news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
-            return news_text
+        if not news_text:
+            main_content = soup.find('main') or soup.find('div', role='main') or soup.find('div', id='__nuxt')
+            if main_content:
+                logging.info("Найден основной контент страницы")
+                news_text = main_content.get_text(separator="\n", strip=True)
+                news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
         
-        logging.error("Не удалось найти новостной блок на странице")
-        return None
+        if not news_text:
+            logging.error("Не удалось найти новостной блок на странице")
+            return None
+        
+        # Очищаем текст от лишних элементов
+        unwanted_phrases = [
+            "cookie policy", "политика использования файлов cookie", "© copyright",
+            "Loading...", "nuxt-loading", "vfsglobal", "javascript"
+        ]
+        for phrase in unwanted_phrases:
+            news_text = news_text.replace(phrase, "")
+            
+        # Удаляем лишние пробелы и пустые строки
+        news_text = re.sub(r'\s+', ' ', news_text).strip()
+        
+        return news_text
 
     except Exception as e:
         logging.error(f"Ошибка при получении новостей: {str(e)}")
-        return None
-
-def fetch_news_alternative():
-    """Альтернативный метод получения новостей для обхода Cloudflare"""
-    try:
-        # Пробуем получить мобильную версию сайта
-        mobile_url = NEWS_URL.replace("//visa.", "//m.visa.")  # Может работать для некоторых сайтов
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-A205U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.210 Mobile Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-        }
-        
-        response = scraper.get(mobile_url, headers=headers, timeout=60)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        content = soup.find('div', class_='content') or soup.find('article')
-        
-        if content:
-            news_text = content.get_text(separator="\n", strip=True)
-            news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
-            return news_text
-        
-        return None
-    except Exception as e:
-        logging.error(f"Ошибка в альтернативном методе: {str(e)}")
         return None
 
 def send_telegram_message(message):
@@ -157,7 +160,7 @@ def send_telegram_message(message):
 
 def calculate_hash(content):
     """Вычисляет стабильный хеш контента"""
-    return hashlib.md5(content.encode('utf-8')).hexdigest()
+    return hashlib.md5(content.encode('utf-8')).hexdigest() if content else ""
 
 def check_news_and_notify():
     """Проверяет новости и отправляет уведомления"""
