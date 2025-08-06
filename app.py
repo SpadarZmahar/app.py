@@ -1,23 +1,26 @@
 import os
+import sys
 import logging
 import time
 import hashlib
 import json
 import requests
 import asyncio
-import threading
 from flask import Flask, request, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from bs4 import BeautifulSoup
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - [%(levelname)s] - %(message)s",
+    stream=sys.stdout  # Гарантирует вывод логов в консоль
 )
 logger = logging.getLogger("VFSMonitor")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+logger.info("🚀 Starting VFS Monitor Bot...")
 
 # Проверка критических переменных среды
 def get_env_var(name, default=None):
@@ -41,7 +44,7 @@ app = Flask(__name__)
 last_news_hash = None
 last_error_time = 0
 
-# Создаем Application для Telegram (инициализация перенесена в функцию)
+# Telegram Application будет инициализировано позже
 telegram_app = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -239,8 +242,22 @@ def setup_telegram_app():
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("status", status_command))
     telegram_app.add_handler(CommandHandler("check", check_command))
+    logger.info("Telegram приложение инициализировано")
 
 # --- WEB SERVER ---
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "VFS Global Monitor",
+        "version": "1.0",
+        "endpoints": {
+            "health": "/health",
+            "webhook": "/webhook",
+            "env_check": "/env"
+        }
+    })
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Endpoint для проверки работоспособности"""
@@ -250,28 +267,46 @@ def health_check():
         "interval_minutes": CHECK_INTERVAL_MINUTES
     })
 
+@app.route("/env")
+def env_check():
+    return jsonify({
+        "RENDER_SERVICE_NAME": os.environ.get("RENDER_SERVICE_NAME"),
+        "TELEGRAM_TOKEN": "present" if os.environ.get("TELEGRAM_TOKEN") else "missing",
+        "PORT": os.environ.get("PORT"),
+        "PYTHON_VERSION": sys.version
+    })
+
 async def setup_webhook():
     """Настройка вебхука Telegram"""
-    # Render автоматически даёт домен вида https://<service-name>.onrender.com
-    service_name = os.environ.get('RENDER_SERVICE_NAME')
-    if not service_name:
-        logger.error("RENDER_SERVICE_NAME не установлен! Вебхук не настроен.")
-        return
-        
-    webhook_url = f"https://{service_name}.onrender.com/webhook"
     try:
-        await telegram_app.bot.set_webhook(url=webhook_url)
-        logger.info(f"Вебхук установлен: {webhook_url}")
+        service_name = os.environ.get('RENDER_SERVICE_NAME')
+        if not service_name:
+            logger.error("RENDER_SERVICE_NAME не установлен в переменных окружения!")
+            return False
+        
+        logger.info(f"Получено имя сервиса: {service_name}")
+        
+        webhook_url = f"https://{service_name}.onrender.com/webhook"
+        logger.info(f"Попытка установки вебхука: {webhook_url}")
+        
+        result = await telegram_app.bot.set_webhook(url=webhook_url)
+        logger.info(f"Вебхук успешно установлен! Ответ Telegram: {result}")
+        return True
     except Exception as e:
-        logger.error(f"Ошибка настройки вебхука: {str(e)}")
+        logger.exception(f"Критическая ошибка при настройке вебхука: {str(e)}")
+        return False
 
 @app.route("/webhook", methods=["POST"])
 async def webhook():
     """Endpoint для обработки обновлений Telegram"""
-    json_data = request.get_json()
-    update = Update.de_json(json_data, telegram_app.bot)
-    await telegram_app.process_update(update)
-    return {"status": "ok"}, 200
+    try:
+        json_data = request.get_json()
+        update = Update.de_json(json_data, telegram_app.bot)
+        await telegram_app.process_update(update)
+        return {"status": "ok"}, 200
+    except Exception as e:
+        logger.error(f"Ошибка в обработке вебхука: {e}")
+        return {"status": "error"}, 500
 
 async def background_page_checker():
     """Фоновая проверка страницы"""
@@ -299,19 +334,26 @@ async def background_page_checker():
 
 async def start_bot():
     """Запуск Telegram бота"""
-    # Инициализация приложения
-    setup_telegram_app()
-    
-    # Настройка вебхука
-    await setup_webhook()
-    
-    # Запуск фоновой задачи
-    asyncio.create_task(background_page_checker())
-    
-    # Запуск обработки обновлений
-    await telegram_app.initialize()
-    await telegram_app.start()
-    logger.info("Telegram бот запущен")
+    try:
+        logger.info("Начало инициализации Telegram бота")
+        setup_telegram_app()
+        
+        logger.info("Настройка вебхука...")
+        webhook_result = await setup_webhook()
+        
+        if not webhook_result:
+            logger.error("Не удалось установить вебхук! Бот не сможет получать сообщения.")
+            return
+        
+        logger.info("Запуск фоновой задачи мониторинга...")
+        asyncio.create_task(background_page_checker())
+        
+        logger.info("Инициализация обработчиков...")
+        await telegram_app.initialize()
+        await telegram_app.start()
+        logger.info("Telegram бот успешно запущен")
+    except Exception as e:
+        logger.exception(f"Критическая ошибка при запуске бота: {str(e)}")
 
 def run_flask():
     """Запуск Flask сервера"""
@@ -320,17 +362,13 @@ def run_flask():
 
 async def main():
     """Главная функция инициализации"""
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Запускаем бота в фоне
+    asyncio.create_task(start_bot())
     
-    # Запускаем бота
-    await start_bot()
-    
-    # Бесконечный цикл, чтобы главный поток не завершился
-    while True:
-        await asyncio.sleep(3600)
+    # Запускаем Flask в главном потоке
+    run_flask()
 
 if __name__ == "__main__":
+    logger.info("Запуск приложения...")
     # Для Render используем asyncio
     asyncio.run(main())
