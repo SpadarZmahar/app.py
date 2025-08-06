@@ -1,183 +1,237 @@
 # -*- coding: utf-8 -*-
+
 import os
 import logging
 import time
 import hashlib
-import random
-import json
 from threading import Thread
-from bs4 import BeautifulSoup
+import cloudscraper
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.ext import Dispatcher, CommandHandler, CallbackContext
+from bs4 import BeautifulSoup
 
-# --- НОВЫЕ ИМПОРТЫ ---
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-
-# --- ОБНОВЛЕННЫЕ НАСТРОЙКИ ---
+# --- НАСТРОЙКИ ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - [%(levelname)s] - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("cloudscraper").setLevel(logging.WARNING)
 
-# Убираем логи для неважных модулей
-for lib in ['urllib3', 'selenium', 'undetected_chromedriver']:
-    logging.getLogger(lib).setLevel(logging.WARNING)
+# Проверка критических переменных среды
+def get_env_var(name):
+    value = os.environ.get(name)
+    if not value:
+        logging.critical(f"Переменная окружения {name} не установлена!")
+        raise ValueError(f"{name} не задана")
+    return value
+
+TELEGRAM_TOKEN = get_env_var("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = get_env_var("TELEGRAM_CHAT_ID")
+
+# WEBHOOK_URL теперь опциональная переменная
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+if not WEBHOOK_URL:
+    logging.warning("WEBHOOK_URL не задан. Вебхук не будет настроен автоматически")
+
+# Конфигурация
+NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
+CHECK_INTERVAL_SECONDS = 60 * 60  # 1 час (60 минут)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+MAX_TEXT_LENGTH = 4000  # Максимальная длина текста для Telegram (4096 с запасом)
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 app = Flask(__name__)
+bot = Bot(token=TELEGRAM_TOKEN)
+dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 last_news_hash = None
-DRIVER_INSTANCES = {}
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{}.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{}.0 Safari/605.1.15"
-]
 
-# --- ОБНОВЛЕННЫЕ ФУНКЦИИ ---
-def get_driver(thread_id):
-    """Инициализация скрытого браузера с уникальными параметрами"""
-    if thread_id in DRIVER_INSTANCES:
-        return DRIVER_INSTANCES[thread_id]
-    
-    chrome_version = random.randint(110, 125)
-    user_agent = random.choice(USER_AGENTS).format(chrome_version)
-    
-    options = uc.ChromeOptions()
-    options.add_argument(f"user-agent={user_agent}")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-web-security")
-    options.add_argument("--allow-running-insecure-content")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-    
-    # Для серверного режима
-    options.add_argument("--headless=new")
-    options.add_argument("--window-size=1920,1080")
-    
-    driver = uc.Chrome(
-        options=options,
-        version_main=chrome_version,
-        enable_cdp_events=True
-    )
-    
-    # Запускаем с настройками stealth
-    driver.execute_cdp_cmd(
-        "Network.setUserAgentOverride",
-        {
-            "userAgent": user_agent,
-            "platform": "Win32",
-            "userAgentMetadata": {
-                "brands": [
-                    {"brand": "Chromium", "version": str(chrome_version)},
-                    {"brand": "Google Chrome", "version": str(chrome_version)},
-                    {"brand": "Not=A?Brand", "version": "24"}
-                ],
-                "fullVersionList": [
-                    {"brand": "Chromium", "version": str(chrome_version)},
-                    {"brand": "Google Chrome", "version": str(chrome_version)},
-                    {"brand": "Not=A?Brand", "version": "24"}
-                ],
-                "platform": "Windows",
-                "platformVersion": "10.0.0",
-                "architecture": "x86",
-                "model": "",
-                "mobile": False
-            }
-        }
-    )
-    
-    # Скрываем WebDriver
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
-    DRIVER_INSTANCES[thread_id] = driver
-    return driver
+# Инициализация CloudScraper
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
+# --- ОСНОВНЫЕ ФУНКЦИИ ---
 def fetch_page_content():
-    """Получение контента через headless Chrome"""
-    thread_id = threading.get_ident()
-    driver = get_driver(thread_id)
-    
+    """Получает содержимое страницы целиком"""
     try:
-        driver.get(NEWS_URL)
+        headers = {
+            'User-Agent': USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'DNT': '1',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-User': '?1',
+            'Sec-Fetch-Dest': 'document'
+        }
         
-        # Ожидание загрузки основного контента
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.news-container"))
-        )
+        response = scraper.get(NEWS_URL, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        # Если страница перенаправляет, используем конечный URL
+        final_url = response.url
+        if final_url != NEWS_URL:
+            logging.info(f"Перенаправление на: {final_url}")
+            response = scraper.get(final_url, headers=headers, timeout=60)
+            response.raise_for_status()
+
+        # Проверяем, не получили ли мы страницу проверки Cloudflare
+        if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
+            logging.warning("Обнаружена страница проверки Cloudflare. Используем альтернативный метод...")
+            # Пробуем получить данные через 30 секунд
+            time.sleep(30)
+            response = scraper.get(NEWS_URL, headers=headers, timeout=60)
+            response.raise_for_status()
+
+        # Извлекаем основной контент страницы
+        soup = BeautifulSoup(response.text, "html.parser")
         
-        # Прокрутка для имитации поведения пользователя
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
-        time.sleep(random.uniform(0.5, 1.5))
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(random.uniform(0.7, 2.0))
-        
-        # Получение обработанного HTML
-        page_source = driver.page_source
-        soup = BeautifulSoup(page_source, "html.parser")
-        
-        # Очистка контента (как в вашем оригинале)
+        # Удаляем ненужные элементы (скрипты, стили и т.д.)
         for element in soup(["script", "style", "meta", "link", "nav", "footer"]):
             element.decompose()
         
+        # Получаем текст страницы
         page_text = soup.get_text(separator="\n", strip=True)
+        
+        # Удаляем лишние пробелы и пустые строки
         page_text = "\n".join(line.strip() for line in page_text.split("\n") if line.strip())
         
-        for phrase in UNWANTED_PHRASES:
+        # Удаляем технические фразы
+        unwanted_phrases = [
+            "cookie policy", "политика использования файлов cookie", "© copyright",
+            "Loading...", "javascript", "vfsglobal", "cloudflare", "rocket-loader"
+        ]
+        for phrase in unwanted_phrases:
             page_text = page_text.replace(phrase, "")
         
+        # Сокращаем слишком длинный текст
         if len(page_text) > MAX_TEXT_LENGTH:
             page_text = page_text[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)"
         
         return page_text
-        
-    except TimeoutException:
-        logger.error("Таймаут при загрузке страницы")
-        return None
+
     except Exception as e:
-        logger.error(f"Ошибка в fetch_page_content: {str(e)}")
+        logging.error(f"Ошибка при получении страницы: {str(e)}")
         return None
 
-# --- ОСТАЛЬНОЙ КОД ОСТАЕТСЯ ПРЕЖНИМ С КОРРЕКТИРОВКАМИ ---
+def send_telegram_message(message):
+    """Отправляет сообщение в Telegram чат"""
+    try:
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        logging.info(f"Сообщение отправлено: {message[:50]}...")
+    except Exception as e:
+        logging.error(f"Ошибка отправки в Telegram: {str(e)}")
+
+def calculate_hash(content):
+    """Вычисляет стабильный хеш контента"""
+    return hashlib.md5(content.encode('utf-8')).hexdigest() if content else ""
+
+def check_news_and_notify():
+    """Проверяет страницу и отправляет уведомления при изменениях"""
+    global last_news_hash
+    logging.info("Запущена проверка страницы")
+
+    page_content = fetch_page_content()
+    if not page_content:
+        logging.warning("Не удалось получить содержимое страницы")
+        send_telegram_message("⚠️ Не удалось получить содержимое страницы VFS")
+        return "❌ Ошибка получения страницы"
+
+    current_hash = calculate_hash(page_content)
+    
+    if last_news_hash is None:
+        last_news_hash = current_hash
+        send_telegram_message(f"✅ Бот запущен! Буду присылать уведомления об изменениях на странице:\n{NEWS_URL}\n\nТекущее содержимое:\n\n{page_content}")
+        return "✅ Первоначальное содержимое загружено"
+    
+    if current_hash != last_news_hash:
+        last_news_hash = current_hash
+        message = f"🆕 ОБНОВЛЕНИЕ НА СТРАНИЦЕ VFS!\n\nСсылка: {NEWS_URL}\n\nНовое содержимое:\n\n{page_content}"
+        send_telegram_message(message)
+        return "✅ Обновление обнаружено и отправлено"
+    
+    return "ℹ️ Изменений нет"
+
+# --- ОБРАБОТЧИКИ КОМАНД TELEGRAM ---
+def start_command(update: Update, context: CallbackContext):
+    update.message.reply_text(f"✅ Бот активен! Автоматически проверяю страницу VFS каждые {CHECK_INTERVAL_SECONDS//60} минут.\nСсылка: {NEWS_URL}")
+
+def status_command(update: Update, context: CallbackContext):
+    status = "🟢 Бот работает\n"
+    status += f"Проверяемая страница: {NEWS_URL}\n"
+    status += f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    if WEBHOOK_URL:
+        status += "✅ Вебхук настроен"
+    else:
+        status += "⚠️ Вебхук не настроен"
+    update.message.reply_text(status)
+
+def check_command(update: Update, context: CallbackContext):
+    update.message.reply_text("🔄 Запускаю ручную проверку страницы...")
+    result = check_news_and_notify()
+    update.message.reply_text(result)
+
+# Регистрация обработчиков команд
+dispatcher.add_handler(CommandHandler("start", start_command))
+dispatcher.add_handler(CommandHandler("status", status_command))
+dispatcher.add_handler(CommandHandler("check", check_command))
+
+@app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    """Endpoint для обработки обновлений Telegram"""
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "OK"
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Endpoint для проверки работоспособности"""
+    return "OK", 200
+
+def setup_webhook():
+    """Настройка вебхука Telegram (только если WEBHOOK_URL задан)"""
+    if not WEBHOOK_URL:
+        logging.warning("WEBHOOK_URL не задан. Пропускаю настройку вебхука")
+        return
+        
+    webhook_path = f"{WEBHOOK_URL}/webhook/{TELEGRAM_TOKEN}"
+    try:
+        bot.set_webhook(url=webhook_path)
+        logging.info(f"Вебхук установлен: {webhook_path}")
+    except Exception as e:
+        logging.error(f"Ошибка настройки вебхука: {str(e)}")
+
 def background_page_checker():
-    """Фоновая проверка с очисткой драйвера"""
-    time.sleep(10)
+    """Фоновая проверка страницы"""
+    time.sleep(10)  # Задержка для инициализации сервера
+    logging.info(f"Фоновый мониторинг запущен. Интервал: {CHECK_INTERVAL_SECONDS} сек")
     
     while True:
         try:
             check_news_and_notify()
-            
-            # Перезапуск драйвера каждые 24 часа
-            if time.time() % 86400 < CHECK_INTERVAL_SECONDS:
-                thread_id = threading.get_ident()
-                if thread_id in DRIVER_INSTANCES:
-                    try:
-                        DRIVER_INSTANCES[thread_id].quit()
-                    except:
-                        pass
-                    del DRIVER_INSTANCES[thread_id]
-            
             time.sleep(CHECK_INTERVAL_SECONDS)
         except Exception as e:
-            logger.error(f"Фоновая ошибка: {str(e)}")
+            logging.error(f"Ошибка в фоновом задании: {str(e)}")
             time.sleep(60)
 
-# Добавляем в конец
-@app.route('/shutdown', methods=['POST'])
-def shutdown():
-    """Корректное завершение работы"""
-    for thread_id, driver in DRIVER_INSTANCES.items():
-        try:
-            driver.quit()
-        except:
-            pass
-    os.kill(os.getpid(), 9)
-    return 'Server shutting down...'
+if __name__ == "__main__":
+    # Настройка вебхука (если URL задан)
+    setup_webhook()
+    
+    # Запуск фонового потока
+    monitor_thread = Thread(target=background_page_checker, daemon=True)
+    monitor_thread.start()
+    
+    # Запуск веб-сервера
+    port = int(os.environ.get("PORT", 8080))
+    logging.info(f"Сервер запущен на порту {port}")
+    app.run(host="0.0.0.0", port=port)
