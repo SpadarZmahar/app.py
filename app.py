@@ -40,8 +40,8 @@ app = Flask(__name__)
 last_news_hash = None
 last_error_time = 0
 
-# Создаем Application для Telegram
-telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+# Создаем Application для Telegram (инициализация перенесена в функцию)
+telegram_app = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def fetch_page_content():
@@ -229,10 +229,15 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     result = await check_news_and_notify()
     await update.message.reply_text(result)
 
-# Регистрация обработчиков команд
-telegram_app.add_handler(CommandHandler("start", start_command))
-telegram_app.add_handler(CommandHandler("status", status_command))
-telegram_app.add_handler(CommandHandler("check", check_command))
+def setup_telegram_app():
+    """Инициализация и настройка Telegram приложения"""
+    global telegram_app
+    telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Регистрация обработчиков команд
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("status", status_command))
+    telegram_app.add_handler(CommandHandler("check", check_command))
 
 # --- WEB SERVER ---
 @app.route("/health", methods=["GET"])
@@ -293,6 +298,9 @@ async def background_page_checker():
 
 async def start_bot():
     """Запуск Telegram бота"""
+    # Инициализация приложения
+    setup_telegram_app()
+    
     # Настройка вебхука
     await setup_webhook()
     
@@ -312,7 +320,7 @@ def run_flask():
 async def main():
     """Главная функция инициализации"""
     # Запускаем бота в фоне
-    asyncio.create_task(start_bot())
+    await start_bot()
     
     # Запускаем Flask в главном потоке
     run_flask()
