@@ -2,8 +2,7 @@ Flask==3.0.3
 requests==2.31.0
 beautifulsoup4==4.12.3
 python-telegram-bot==20.6
-cloudscraper==1.2.75  # Обновленная версия
+cloudscraper==1.2.75
 selenium==4.19.0
 webdriver-manager==4.0.1
 Pillow==10.3.0
-gunicorn==21.2.0
