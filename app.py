@@ -5,6 +5,7 @@ import hashlib
 import json
 import requests
 import asyncio
+import threading
 from flask import Flask, request, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -319,11 +320,16 @@ def run_flask():
 
 async def main():
     """Главная функция инициализации"""
-    # Запускаем бота в фоне
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Запускаем бота
     await start_bot()
     
-    # Запускаем Flask в главном потоке
-    run_flask()
+    # Бесконечный цикл, чтобы главный поток не завершился
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     # Для Render используем asyncio
