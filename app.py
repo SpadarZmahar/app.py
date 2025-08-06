@@ -4,8 +4,6 @@ import os
 import logging
 import time
 import hashlib
-import json
-import re
 from threading import Thread
 import cloudscraper
 from flask import Flask, request
@@ -41,6 +39,7 @@ if not WEBHOOK_URL:
 NEWS_URL = "https://visa.vfsglobal.com/blr/ru/pol/news/release-appointment"
 CHECK_INTERVAL_SECONDS = 60 * 60  # 1 час (60 минут)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+MAX_TEXT_LENGTH = 4000  # Максимальная длина текста для Telegram (4096 с запасом)
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 app = Flask(__name__)
@@ -58,8 +57,8 @@ scraper = cloudscraper.create_scraper(
 )
 
 # --- ОСНОВНЫЕ ФУНКЦИИ ---
-def fetch_news():
-    """Получает содержимое новостного блока с сайта VFS"""
+def fetch_page_content():
+    """Получает содержимое страницы целиком"""
     try:
         headers = {
             'User-Agent': USER_AGENT,
@@ -85,87 +84,31 @@ def fetch_news():
             response = scraper.get(NEWS_URL, headers=headers, timeout=60)
             response.raise_for_status()
 
+        # Извлекаем основной контент страницы
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Попробуем найти JSON-данные в скриптах
-        script_data = soup.find_all('script', type='application/ld+json')
-        news_text = None
+        # Получаем весь текст страницы
+        page_text = soup.get_text(separator="\n", strip=True)
         
-        for script in script_data:
-            try:
-                # Обрабатываем как JSON
-                data = json.loads(script.string)
-                if isinstance(data, dict) and data.get("@type") == "NewsArticle":
-                    logging.info("Найден скрипт с данными новости (JSON-LD)")
-                    headline = data.get("headline", "")
-                    body = data.get("articleBody", "")
-                    if headline or body:
-                        news_text = f"{headline}\n\n{body}" if headline and body else headline or body
-                        break
-            except:
-                # Пробуем извлечь данные с помощью регулярных выражений
-                script_text = script.string or ""
-                if '"@type":"NewsArticle"' in script_text:
-                    logging.info("Найден скрипт с данными новости (текстовый поиск)")
-                    headline_match = re.search(r'"headline":\s*"([^"]+)"', script_text)
-                    body_match = re.search(r'"articleBody":\s*"([^"]+)"', script_text)
-                    
-                    if headline_match or body_match:
-                        headline = headline_match.group(1) if headline_match else ""
-                        body = body_match.group(1) if body_match else ""
-                        news_text = f"{headline}\n\n{body}" if headline and body else headline or body
-                        break
-
-        # Если не нашли в скриптах, попробуем основной контент
-        if not news_text:
-            # Основные контейнеры для контента
-            content_selectors = [
-                'div.vfsg-news-content',  # Старый селектор
-                'div.news-content',       # Общий класс
-                'div.announcement',       # Другой возможный класс
-                'div.content-main',       # Основной контент
-                'div.page-content',       # Контент страницы
-                'main',                   # Тег main
-                'div[role="main"]',       # Контейнер с role="main"
-                'div#__nuxt'              # Nuxt.js контейнер
-            ]
-            
-            for selector in content_selectors:
-                content = soup.select_one(selector)
-                if content:
-                    logging.info(f"Найден контент с селектором: {selector}")
-                    news_text = content.get_text(separator="\n", strip=True)
-                    break
+        # Удаляем лишние пробелы и пустые строки
+        page_text = "\n".join(line.strip() for line in page_text.split("\n") if line.strip())
         
-        if not news_text:
-            logging.error("Не удалось найти новостной блок на странице")
-            return None
+        # Удаляем технические фразы
+        unwanted_phrases = [
+            "cookie policy", "политика использования файлов cookie", "© copyright",
+            "Loading...", "nuxt-loading", "javascript", "vfsglobal", "cloudflare"
+        ]
+        for phrase in unwanted_phrases:
+            page_text = page_text.replace(phrase, "")
         
-        # Очищаем текст только если он слишком длинный
-        if len(news_text) > 500:
-            # Удаляем технические фразы
-            unwanted_phrases = [
-                "cookie policy", "политика использования файлов cookie", "© copyright",
-                "Loading...", "nuxt-loading", "javascript", "vfsglobal", "cloudflare"
-            ]
-            for phrase in unwanted_phrases:
-                news_text = news_text.replace(phrase, "")
-            
-            # Удаляем лишние пробелы
-            news_text = re.sub(r'\s+', ' ', news_text).strip()
+        # Сокращаем слишком длинный текст
+        if len(page_text) > MAX_TEXT_LENGTH:
+            page_text = page_text[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)"
         
-        # Удаляем пустые строки и нормализуем текст
-        news_text = "\n".join(line.strip() for line in news_text.split("\n") if line.strip())
-        
-        # Если текст слишком короткий, вероятно, мы получили не то
-        if len(news_text) < 50:
-            logging.warning(f"Текст новости слишком короткий: {len(news_text)} символов")
-            return None
-        
-        return news_text
+        return page_text
 
     except Exception as e:
-        logging.error(f"Ошибка при получении новостей: {str(e)}")
+        logging.error(f"Ошибка при получении страницы: {str(e)}")
         return None
 
 def send_telegram_message(message):
@@ -181,25 +124,25 @@ def calculate_hash(content):
     return hashlib.md5(content.encode('utf-8')).hexdigest() if content else ""
 
 def check_news_and_notify():
-    """Проверяет новости и отправляет уведомления"""
+    """Проверяет страницу и отправляет уведомления при изменениях"""
     global last_news_hash
-    logging.info("Запущена проверка новостей")
+    logging.info("Запущена проверка страницы")
 
-    news_text = fetch_news()
-    if not news_text:
-        logging.warning("Не удалось получить новости")
-        return "❌ Ошибка получения новостей"
+    page_content = fetch_page_content()
+    if not page_content:
+        logging.warning("Не удалось получить содержимое страницы")
+        return "❌ Ошибка получения страницы"
 
-    current_hash = calculate_hash(news_text)
+    current_hash = calculate_hash(page_content)
     
     if last_news_hash is None:
         last_news_hash = current_hash
-        send_telegram_message(f"✅ Бот запущен. Текущая новость:\n\n{news_text}")
-        return "✅ Первоначальная новость загружена"
+        send_telegram_message(f"✅ Бот запущен. Текущее содержимое страницы:\n\n{page_content}")
+        return "✅ Первоначальное содержимое загружено"
     
     if current_hash != last_news_hash:
         last_news_hash = current_hash
-        message = f"🆕 ОБНОВЛЕНИЕ НА VFS:\n\n{news_text}"
+        message = f"🆕 ИЗМЕНЕНИЯ НА СТРАНИЦЕ VFS:\n\n{page_content}"
         send_telegram_message(message)
         return "✅ Обновление обнаружено и отправлено"
     
@@ -207,7 +150,7 @@ def check_news_and_notify():
 
 # --- ОБРАБОТЧИКИ КОМАНД TELEGRAM ---
 def start_command(update: Update, context: CallbackContext):
-    update.message.reply_text("✅ Бот активен! Автоматически проверяю новости VFS каждые 5 минут.")
+    update.message.reply_text("✅ Бот активен! Автоматически проверяю страницу VFS каждые 5 минут.")
 
 def status_command(update: Update, context: CallbackContext):
     status = "🟢 Бот работает\n"
@@ -253,8 +196,8 @@ def setup_webhook():
     except Exception as e:
         logging.error(f"Ошибка настройки вебхука: {str(e)}")
 
-def background_news_checker():
-    """Фоновая проверка новостей"""
+def background_page_checker():
+    """Фоновая проверка страницы"""
     time.sleep(10)  # Задержка для инициализации сервера
     logging.info(f"Фоновый мониторинг запущен. Интервал: {CHECK_INTERVAL_SECONDS} сек")
     
@@ -271,7 +214,7 @@ if __name__ == "__main__":
     setup_webhook()
     
     # Запуск фонового потока
-    monitor_thread = Thread(target=background_news_checker, daemon=True)
+    monitor_thread = Thread(target=background_page_checker, daemon=True)
     monitor_thread.start()
     
     # Запуск веб-сервера
