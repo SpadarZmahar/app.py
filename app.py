@@ -77,18 +77,10 @@ def fetch_page_content():
         response = scraper.get(NEWS_URL, headers=headers, timeout=60)
         response.raise_for_status()
 
-        # Если страница перенаправляет, используем конечный URL
-        final_url = response.url
-        if final_url != NEWS_URL:
-            logging.info(f"Перенаправление на: {final_url}")
-            response = scraper.get(final_url, headers=headers, timeout=60)
-            response.raise_for_status()
-
         # Проверяем, не получили ли мы страницу проверки Cloudflare
         if "cf-browser-verification" in response.text or "rocket-loader" in response.text:
-            logging.warning("Обнаружена страница проверки Cloudflare. Используем альтернативный метод...")
-            # Пробуем получить данные через 30 секунд
-            time.sleep(30)
+            logging.warning("Обнаружена страница проверки Cloudflare. Увеличиваем задержку...")
+            time.sleep(15)
             response = scraper.get(NEWS_URL, headers=headers, timeout=60)
             response.raise_for_status()
 
@@ -96,11 +88,28 @@ def fetch_page_content():
         soup = BeautifulSoup(response.text, "html.parser")
         
         # Удаляем ненужные элементы (скрипты, стили и т.д.)
-        for element in soup(["script", "style", "meta", "link", "nav", "footer"]):
+        for element in soup(["script", "style", "meta", "link", "nav", "footer", "header"]):
             element.decompose()
         
-        # Получаем текст страницы
-        page_text = soup.get_text(separator="\n", strip=True)
+        # Извлекаем основной контент
+        main_content = soup.find('main') or soup.find('div', role='main') or soup
+        
+        # Если нашли контейнер с контентом, извлекаем его текст
+        if main_content:
+            # Получаем текст с сохранением структуры
+            page_text = ""
+            for element in main_content.find_all(['p', 'h1', 'h2', 'h3', 'li']):
+                # Добавляем переносы строк для разных элементов
+                if element.name in ['h1', 'h2', 'h3']:
+                    page_text += "\n\n" + element.get_text().strip() + "\n"
+                elif element.name == 'li':
+                    page_text += "• " + element.get_text().strip() + "\n"
+                else:
+                    page_text += element.get_text().strip() + "\n"
+        
+        # Если не нашли структурированный контент, используем весь текст
+        if not page_text:
+            page_text = main_content.get_text(separator="\n", strip=True)
         
         # Удаляем лишние пробелы и пустые строки
         page_text = "\n".join(line.strip() for line in page_text.split("\n") if line.strip())
