@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 from PIL import Image
 import io
@@ -69,19 +70,23 @@ def init_selenium_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,720")
-    options.add_argument(f"user-agent={USER_AGENT}")
+    options.add_argument(f"--user-agent={USER_AGENT}")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     
-    # Для Railway
-    options.binary_location = "/usr/bin/google-chrome-stable"
+    # Для Railway и подобных платформ
+    chrome_binary = "/usr/bin/google-chrome-stable"
+    if os.path.exists(chrome_binary):
+        options.binary_location = chrome_binary
     
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
-    return driver
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Chrome драйвера: {str(e)}")
+        raise
 
 def fetch_page_content():
     """Получает содержимое страницы с обходом Cloudflare"""
@@ -147,8 +152,9 @@ def fetch_page_content():
 
         except Exception as e:
             logger.error(f"Ошибка при получении страницы (попытка {attempt}): {str(e)}")
-            time.sleep(delay)
-            delay *= 2
+            if attempt < max_attempts:
+                time.sleep(delay)
+                delay *= 2
     
     logger.warning("Не удалось получить содержимое через requests. Пробуем Selenium...")
     return fetch_with_selenium()
@@ -169,7 +175,7 @@ def fetch_with_selenium():
             time.sleep(10)
         
         # Получение основного контента
-        content = driver.find_element("tag name", "body").text
+        content = driver.find_element(By.TAG_NAME, "body").text
         return content[:MAX_TEXT_LENGTH] + "\n\n... (текст обрезан)" if len(content) > MAX_TEXT_LENGTH else content
     
     except Exception as e:
@@ -178,7 +184,10 @@ def fetch_with_selenium():
     
     finally:
         if driver:
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии драйвера: {str(e)}")
 
 def capture_screenshot():
     """Делает скриншот страницы и возвращает как bytes"""
@@ -204,11 +213,15 @@ def capture_screenshot():
         
         except Exception as e:
             logger.error(f"Ошибка при создании скриншота (попытка {attempt}): {str(e)}")
-            time.sleep(5)
+            if attempt < MAX_SCREENSHOT_ATTEMPTS:
+                time.sleep(5)
         
         finally:
             if driver:
-                driver.quit()
+                try:
+                    driver.quit()
+                except Exception as e:
+                    logger.error(f"Ошибка при закрытии драйвера: {str(e)}")
     
     return None
 
@@ -218,11 +231,12 @@ def send_telegram_message(message, image_bytes=None):
         if image_bytes:
             # Для длинных сообщений делаем обрезанный caption
             caption = message if len(message) <= 1000 else message[:900] + "\n\n... (сообщение сокращено)"
-            bot.send_photo(
-                chat_id=TELEGRAM_CHAT_ID,
-                photo=image_bytes,
-                caption=caption
-            )
+            with io.BytesIO(image_bytes) as photo:
+                bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=photo,
+                    caption=caption
+                )
             logger.info("Скриншот отправлен в Telegram")
         else:
             # Разбиваем длинные сообщения на части
@@ -233,7 +247,7 @@ def send_telegram_message(message, image_bytes=None):
                     time.sleep(1)
             else:
                 bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-            logger.info(f"Сообщение отправлено")
+            logger.info("Сообщение отправлено")
     except Exception as e:
         logger.error(f"Ошибка отправки в Telegram: {str(e)}")
 
@@ -248,8 +262,8 @@ def save_state():
         'last_error_time': last_error_time
     }
     try:
-        with open('state.json', 'w') as f:
-            json.dump(state, f)
+        with open('state.json', 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"Ошибка сохранения состояния: {str(e)}")
 
@@ -258,7 +272,7 @@ def load_state():
     global last_news_hash, last_error_time
     try:
         if os.path.exists('state.json'):
-            with open('state.json', 'r') as f:
+            with open('state.json', 'r', encoding='utf-8') as f:
                 state = json.load(f)
                 last_news_hash = state.get('last_news_hash')
                 last_error_time = state.get('last_error_time', 0)
@@ -347,7 +361,7 @@ def status_command(update: Update, context: CallbackContext):
     status = "🟢 Бот работает\n"
     status += f"Проверяемая страница: {NEWS_URL}\n"
     status += f"Интервал проверки: {CHECK_INTERVAL_MINUTES} минут\n"
-    status += f"Последняя проверка: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    status += f"Время: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
     
     if WEBHOOK_URL:
         status += "✅ Вебхук настроен\n"
@@ -376,17 +390,22 @@ dispatcher.add_handler(CommandHandler("check", check_command))
 @app.route(f"/webhook/{TELEGRAM_TOKEN}", methods=["POST"])
 def webhook():
     """Endpoint для обработки обновлений Telegram"""
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return "OK"
+    try:
+        update = Update.de_json(request.get_json(force=True), bot)
+        dispatcher.process_update(update)
+        return "OK"
+    except Exception as e:
+        logger.error(f"Ошибка обработки webhook: {str(e)}")
+        return "ERROR", 500
 
 @app.route("/health", methods=["GET"])
 def health_check():
     """Endpoint для проверки работоспособности"""
     return json.dumps({
         "status": "ok",
-        "last_check": time.strftime('%Y-%m-%d %H:%M:%S'),
-        "interval_minutes": CHECK_INTERVAL_MINUTES
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "interval_minutes": CHECK_INTERVAL_MINUTES,
+        "monitoring_active": last_news_hash is not None
     }), 200
 
 def setup_webhook():
@@ -428,14 +447,19 @@ def background_page_checker():
             time.sleep(300)  # Пауза 5 минут при ошибке
 
 if __name__ == "__main__":
-    # Настройка вебхука (если URL задан)
-    setup_webhook()
+    try:
+        # Настройка вебхука (если URL задан)
+        setup_webhook()
+        
+        # Запуск фонового потока
+        monitor_thread = Thread(target=background_page_checker, daemon=True)
+        monitor_thread.start()
+        
+        # Запуск веб-сервера
+        port = int(get_env_var("PORT", "8000"))
+        logger.info(f"Сервер запущен на порту {port}")
+        app.run(host="0.0.0.0", port=port, use_reloader=False)
     
-    # Запуск фонового потока
-    monitor_thread = Thread(target=background_page_checker, daemon=True)
-    monitor_thread.start()
-    
-    # Запуск веб-сервера
-    port = int(get_env_var("PORT", "8000"))
-    logger.info(f"Сервер запущен на порту {port}")
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+    except Exception as e:
+        logger.critical(f"Критическая ошибка при запуске: {str(e)}")
+        raise
